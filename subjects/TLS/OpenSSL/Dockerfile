@@ -38,6 +38,9 @@ WORKDIR /home/ubuntu
 # Import environment variable to pass as parameter to make (e.g., to make parallel builds with -j)
 ARG MAKE_OPT
 
+# Install AFLNet build dependency
+RUN sudo apt-get -y install libcap-dev
+
 # Set up fuzzers
 RUN git clone --branch mab https://github.com/axellervik/mabflnet.git aflnet && \
     cd aflnet && \
