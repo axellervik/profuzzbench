@@ -39,7 +39,9 @@ WORKDIR /home/ubuntu
 ARG MAKE_OPT
 
 # Install AFLNet build dependency
-RUN sudo apt-get -y install libcap-dev
+USER root
+RUN apt-get -y install libcap-dev
+USER ubuntu
 
 # Set up fuzzers
 RUN git clone --branch mab https://github.com/axellervik/mabflnet.git aflnet && \
