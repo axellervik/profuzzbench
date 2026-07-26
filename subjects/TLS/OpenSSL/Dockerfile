@@ -1,5 +1,7 @@
 FROM openssl-mabflnet-base
 
+ENV WORKDIR="/home/ubuntu/experiments"
+
 # Import environment variable to pass as parameter to make (e.g., to make parallel builds with -j)
 ARG MAKE_OPT
 
