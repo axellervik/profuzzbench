@@ -10,8 +10,8 @@ strstr() {
   return 0
 }
 
-#Commands for afl-based fuzzers (e.g., aflnet, aflnwe)
-if $(strstr $FUZZER "afl"); then
+#Commands for afl-based fuzzers (e.g., aflnet, aflnwe, mabflnet)
+if $(strstr $FUZZER "afl") || $(strstr $FUZZER "mabflnet"); then
 
   # Run fuzzer-specific commands (if any)
   if [ -e ${WORKDIR}/run-${FUZZER} ]; then
