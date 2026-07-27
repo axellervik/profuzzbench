@@ -195,6 +195,30 @@ run_one() {
     fi
   done
 
+  # Extract immediately so results are inspectable before Phase 3
+  if [ -f "$TARBALL" ]; then
+    tar -xzf "$TARBALL" -C "$RESULTS_DIR" \
+      && log "  Extracted immediately: $TARBALL" \
+      || warn "  Immediate extraction failed for $TARBALL"
+  fi
+
+  # Per-run mini-summary
+  local STATSFILE="${RESULTS_DIR}/${OUTDIR}/fuzzer_stats"
+  local MABFILE="${RESULTS_DIR}/${OUTDIR}/mab_stats"
+  if [ -f "$STATSFILE" ]; then
+    local EXECS PATHS CRASHES MAB_ROUNDS
+    EXECS=$(grep   "^execs_done"     "$STATSFILE" | awk -F': ' '{print $2}' | tr -d ' ')
+    PATHS=$(grep   "^paths_total"    "$STATSFILE" | awk -F': ' '{print $2}' | tr -d ' ')
+    CRASHES=$(grep "^unique_crashes" "$STATSFILE" | awk -F': ' '{print $2}' | tr -d ' ')
+    if [ -f "$MABFILE" ]; then
+      MAB_ROUNDS=$(grep -v '^#' "$MABFILE" | grep -v '^mab' | grep -v '^timestamp' \
+        | awk 'NF>=6 {if($6+0 > max) max=$6+0} END {print (max>0?max:"0")}')
+    else
+      MAB_ROUNDS="-"
+    fi
+    log "  Quick stats: execs=${EXECS} paths=${PATHS} crashes=${CRASHES} mab_rounds=${MAB_ROUNDS}"
+  fi
+
   # Remove container
   docker rm "$CID" > /dev/null 2>&1 || true
   LIVE_CONTAINERS=("${LIVE_CONTAINERS[@]/$CID/}")  # remove from registry
@@ -289,12 +313,17 @@ run_parallel() {
 # ---------------------------------------------------------------------------
 
 extract_results() {
-  log "=== Extracting tarballs ==="
+  log "=== Extracting tarballs (skipping already-extracted) ==="
   for entry in "${MAB_ALGOS[@]}" "${BASELINE_ALGOS[@]}"; do
     local S="${entry%%:*}"
     local NAME="${entry##*:}"
     local OUTDIR="out-1h-s${S}-${NAME}"
     local TARBALL="${RESULTS_DIR}/${OUTDIR}_1.tar.gz"
+    # Skip if already extracted by run_one()
+    if [ -d "${RESULTS_DIR}/${OUTDIR}" ]; then
+      log "  Already extracted: ${OUTDIR}/ (skipping)"
+      continue
+    fi
     if [ -f "$TARBALL" ]; then
       tar -xzf "$TARBALL" -C "$RESULTS_DIR" \
         && log "  Extracted: $TARBALL" \
