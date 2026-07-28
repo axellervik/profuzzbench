@@ -1,24 +1,15 @@
 #!/bin/bash
-# run_1h_pilots.sh — 1-hour MAB validation pilots + baseline comparison
-#                    10 repetitions per algorithm (matches production)
+# run_30min_mab_parallel.sh — 30-minute MAB validation pilots
 #
-# Phase 1 (sequential per algo, parallel within):
-#   MAB algorithms s4..s7, one algo at a time, 10 containers in parallel each.
-#   (~4 h total wall time, 10 cores per algo)
-#
-# Phase 2 (all parallel):
-#   Baselines s1, s2, s3 — all 30 containers launched simultaneously.
-#   (~1 h total wall time, 30 cores)
-#
-# Phase 3 (post-processing):
-#   Extract tarballs, print summary table, render IPSM PNGs, verify MAB outputs.
+# All 4 MAB algorithms run 10 repetitions in parallel (40 containers total).
+# Each run is 30 minutes (1800 seconds). Total wall time: ~30 minutes.
 #
 # Designed to run unsupervised. All output is tee'd to a timestamped log file.
 # The script traps SIGINT/SIGTERM and cleans up any live containers before exit.
 #
 # Prerequisites:
 #   source ~/fuzz/profuzzbench/fuzz-env.sh
-#   bash run_1h_pilots.sh
+#   bash run_30min_mab_parallel.sh
 #
 # Required env vars (set by fuzz-env.sh):
 #   PFBENCH   — path to profuzzbench repo  (e.g. ~/fuzz/profuzzbench)
@@ -33,14 +24,14 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 
-RUNS=10                               # repetitions per algorithm
-TIMEOUT=3600                          # 1 hour per run
+RUNS=10                               # repetitions per MAB algorithm
+TIMEOUT=1800                          # 30 minutes per run
 SKIPCOUNT=5                           # gcovr every 5 seeds
 IMAGE="openssl-mabflnet"
 COMMON_OPTS="-P TLS -D 10000 -q 3 -E -K -R -W 100"
-MIN_DISK_MB=5120                      # refuse to start a phase if < 5 GB free
+MIN_DISK_MB=5120                      # refuse to start if < 5 GB free
 CONTAINER_START_WAIT=15               # seconds to wait before liveness check
-RESULTS_DIR="${RESULTS}/1h-pilots"
+RESULTS_DIR="${RESULTS}/30min-mab-parallel"
 LOG_FILE="${RESULTS_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
 
 MAB_ALGOS=(
@@ -48,12 +39,6 @@ MAB_ALGOS=(
   "5:EXP3-IX"
   "6:SB-EXP3"
   "7:SB-EXP3-IX"
-)
-
-BASELINE_ALGOS=(
-  "1:RANDOM"
-  "2:ROUND-ROBIN"
-  "3:FAVOR"
 )
 
 # ---------------------------------------------------------------------------
@@ -99,29 +84,24 @@ trap 'log "Caught signal — cleaning up..."; cleanup_containers; exit 1' \
 preflight() {
   log "=== Pre-flight checks ==="
 
-  # Docker daemon
   docker info &>/dev/null || die "Docker daemon not running."
   log "  Docker daemon: OK"
 
-  # Image exists
   docker image inspect "$IMAGE" &>/dev/null \
     || die "Docker image '$IMAGE' not found. Build it first."
   log "  Image '$IMAGE': found"
 
-  # Required env vars
   [ -n "${PFBENCH:-}" ] || die "PFBENCH is not set. Source fuzz-env.sh first."
   [ -n "${RESULTS:-}" ] || die "RESULTS is not set. Source fuzz-env.sh first."
   log "  PFBENCH=$PFBENCH"
   log "  RESULTS=$RESULTS"
 
-  # Results dir writable
   mkdir -p "$RESULTS_DIR"
   touch "${RESULTS_DIR}/.write_test" \
     && rm "${RESULTS_DIR}/.write_test" \
     || die "Results directory not writable: $RESULTS_DIR"
   log "  Results dir: $RESULTS_DIR (writable)"
 
-  # graphviz
   if ! command -v dot &>/dev/null; then
     warn "'dot' (graphviz) not found — IPSM PNGs will be skipped."
     warn "Install with: sudo apt-get install graphviz"
@@ -130,7 +110,7 @@ preflight() {
   fi
 
   log "  Runs per algorithm: $RUNS"
-  log "  Timeout per run:    ${TIMEOUT}s"
+  log "  Timeout per run:    ${TIMEOUT}s (30 minutes)"
   log "=== Pre-flight OK ==="
   echo ""
 }
@@ -164,136 +144,41 @@ quick_stats() {
     return
   fi
 
-  local execs paths crashes mab_rounds
+  local execs paths crashes mab_pulls
   execs=$(grep   "^execs_done"     "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
   paths=$(grep   "^paths_total"    "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
   crashes=$(grep "^unique_crashes" "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
 
   if [ -f "$mabfile" ]; then
-    mab_rounds=$(grep -v '^#' "$mabfile" | grep -v '^mab' | grep -v '^timestamp' \
-      | awk 'NF>=6 {if($6+0 > max) max=$6+0} END {print (max>0?max:"0")}')
+    mab_pulls=$(grep -v '^#' "$mabfile" | grep -v '^mab' | grep -v '^timestamp' \
+      | awk 'NF>=6 {sum+=$3} END {print (sum>0?sum:"0")}')
   else
-    mab_rounds="-"
+    mab_pulls="-"
   fi
 
-  log "    rep${rep}: execs=${execs} paths=${paths} crashes=${crashes} mab_rounds=${mab_rounds}"
+  log "    rep${rep}: execs=${execs} paths=${paths} crashes=${crashes} mab_pulls=${mab_pulls}"
 }
 
 # ---------------------------------------------------------------------------
-# Run RUNS containers for one algorithm in parallel, wait for all, copy and
-# immediately extract results.
-#
-# Usage: run_algo S NAME
-#
-# Tarballs:      ${RESULTS_DIR}/${OUTDIR}_1.tar.gz .. ${OUTDIR}_${RUNS}.tar.gz
-# Extracted dirs: ${RESULTS_DIR}/${OUTDIR}_1/     .. ${OUTDIR}_${RUNS}/
+# Run all MAB algorithms in parallel — all 4 algos × 10 reps = 40 containers
 # ---------------------------------------------------------------------------
 
-run_algo() {
-  local S="$1" NAME="$2"
-  local OUTDIR="out-1h-s${S}-${NAME}"
-  local OPTS="${COMMON_OPTS} -s ${S}"
-
-  log "--- Starting s${S} (${NAME}) — ${RUNS} reps in parallel ---"
-  check_disk "s${S} (${NAME})"
-
-  # Launch all RUNS containers
-  local -a cids=()
-  local i
-  for i in $(seq 1 "$RUNS"); do
-    local CID
-    CID=$(docker run --cpus=1 -d \
-      "$IMAGE" \
-      /bin/bash -c \
-      "cd /home/ubuntu/experiments && run mabflnet '${OUTDIR}' '${OPTS}' ${TIMEOUT} ${SKIPCOUNT}")
-    register_container "$CID"
-    cids+=("$CID")
-    log "  rep${i} container started: ${CID}"
-  done
-
-  # Liveness check
-  sleep "$CONTAINER_START_WAIT"
-  for i in "${!cids[@]}"; do
-    local CID="${cids[$i]}"
-    local rep=$((i + 1))
-    if ! docker inspect --format='{{.State.Running}}' "$CID" 2>/dev/null | grep -q "true"; then
-      warn "  rep${rep} container ${CID} exited within ${CONTAINER_START_WAIT}s."
-      docker logs --tail 30 "$CID" 2>&1 | while IFS= read -r line; do warn "    $line"; done
-    else
-      log "  rep${rep} container ${CID}: running (liveness OK)"
-    fi
-  done
-
-  # Wait for all reps to finish
-  log "  Waiting for all ${RUNS} reps to finish..."
-  for CID in "${cids[@]}"; do
-    docker wait "$CID" > /dev/null || warn "  docker wait returned non-zero for ${CID}."
-  done
-  log "  All reps finished."
-
-  # Copy tarballs, extract immediately into _N dirs, print quick stats
-  for i in "${!cids[@]}"; do
-    local CID="${cids[$i]}"
-    local rep=$((i + 1))
-    local TARBALL="${RESULTS_DIR}/${OUTDIR}_${rep}.tar.gz"
-    local REP_DIR="${RESULTS_DIR}/${OUTDIR}_${rep}"
-
-    # Copy (retry up to 3x)
-    local attempt
-    for attempt in 1 2 3; do
-      if docker cp "${CID}:/home/ubuntu/experiments/${OUTDIR}.tar.gz" "$TARBALL" 2>/dev/null; then
-        log "  rep${rep}: tarball copied → ${TARBALL}"
-        break
-      else
-        warn "  rep${rep}: docker cp attempt ${attempt}/3 failed."
-        sleep 5
-      fi
-      if [ "$attempt" -eq 3 ]; then
-        warn "  rep${rep}: could not copy tarball after 3 attempts."
-      fi
-    done
-
-    # Extract; tarball contains ${OUTDIR}/ at top level — rename to ${OUTDIR}_${rep}/
-    if [ -f "$TARBALL" ]; then
-      if [ -d "$REP_DIR" ]; then
-        log "  rep${rep}: ${REP_DIR} already exists — skipping extraction."
-      else
-        tar -xzf "$TARBALL" -C "$RESULTS_DIR" \
-          && mv "${RESULTS_DIR}/${OUTDIR}" "$REP_DIR" \
-          && log "  rep${rep}: extracted → ${REP_DIR}" \
-          || warn "  rep${rep}: extraction/rename failed for ${TARBALL}"
-      fi
-      quick_stats "$REP_DIR" "$rep"
-    fi
-
-    docker rm "$CID" > /dev/null 2>&1 || true
-    LIVE_CONTAINERS=("${LIVE_CONTAINERS[@]/$CID/}")
-  done
-
-  log "--- s${S} (${NAME}) done ---"
-  echo ""
-}
-
-# ---------------------------------------------------------------------------
-# Run all baseline algorithms in parallel (RUNS reps each = RUNS×3 containers).
-# ---------------------------------------------------------------------------
-
-run_parallel_baselines() {
+run_all_parallel() {
   local -a all_cids=()
-  local -a all_names=()    # algo name for each container
-  local -a all_ss=()       # -s value for each container
-  local -a all_outdirs=()  # base OUTDIR (without _N suffix)
-  local -a all_reps=()     # rep index for each container
+  local -a all_names=()     # parallel arrays: algo name for each container
+  local -a all_outdirs=()   # base OUTDIR (without _N suffix)
+  local -a all_reps=()      # rep index for each container
+  local -a all_s_values=()  # seed selection algo number
 
-  check_disk "parallel baselines"
+  check_disk "parallel MAB algorithms"
 
-  local total=$(( ${#BASELINE_ALGOS[@]} * RUNS ))
-  log "--- Starting parallel baselines: ${#BASELINE_ALGOS[@]} algos x ${RUNS} reps = ${total} containers ---"
+  local total=$(( ${#MAB_ALGOS[@]} * RUNS ))
+  log "--- Starting all MAB algorithms: ${#MAB_ALGOS[@]} algos × ${RUNS} reps = ${total} containers ---"
 
-  for entry in "${BASELINE_ALGOS[@]}"; do
+  for entry in "${MAB_ALGOS[@]}"; do
     local S="${entry%%:*}"
     local NAME="${entry##*:}"
-    local OUTDIR="out-1h-s${S}-${NAME}"
+    local OUTDIR="out-30m-s${S}-${NAME}"
     local OPTS="${COMMON_OPTS} -s ${S}"
 
     for i in $(seq 1 "$RUNS"); do
@@ -305,9 +190,9 @@ run_parallel_baselines() {
       register_container "$CID"
       all_cids+=("$CID")
       all_names+=("$NAME")
-      all_ss+=("$S")
       all_outdirs+=("$OUTDIR")
       all_reps+=("$i")
+      all_s_values+=("$S")
       log "  s${S} (${NAME}) rep${i} container started: ${CID}"
     done
   done
@@ -324,43 +209,44 @@ run_parallel_baselines() {
   log "  Liveness checks done."
 
   # Wait for all containers
-  log "  Waiting for all ${total} baseline containers to finish..."
+  log "  Waiting for all ${total} containers to finish (${TIMEOUT}s + post-run overhead)..."
   for CID in "${all_cids[@]}"; do
     docker wait "$CID" > /dev/null || warn "  docker wait non-zero for ${CID}."
   done
-  log "  All baseline containers finished."
+  log "  All containers finished."
 
-  # Copy, extract into _N dirs, quick stats
+  # Copy, extract, quick stats
   for i in "${!all_cids[@]}"; do
     local CID="${all_cids[$i]}"
     local OUTDIR="${all_outdirs[$i]}"
     local NAME="${all_names[$i]}"
     local rep="${all_reps[$i]}"
+    local S="${all_s_values[$i]}"
     local TARBALL="${RESULTS_DIR}/${OUTDIR}_${rep}.tar.gz"
     local REP_DIR="${RESULTS_DIR}/${OUTDIR}_${rep}"
 
     local attempt
     for attempt in 1 2 3; do
       if docker cp "${CID}:/home/ubuntu/experiments/${OUTDIR}.tar.gz" "$TARBALL" 2>/dev/null; then
-        log "  ${NAME} rep${rep}: tarball copied → ${TARBALL}"
+        log "  s${S} (${NAME}) rep${rep}: tarball copied → ${TARBALL}"
         break
       else
-        warn "  ${NAME} rep${rep}: docker cp attempt ${attempt}/3 failed."
+        warn "  s${S} (${NAME}) rep${rep}: docker cp attempt ${attempt}/3 failed."
         sleep 5
       fi
       if [ "$attempt" -eq 3 ]; then
-        warn "  ${NAME} rep${rep}: could not copy tarball after 3 attempts."
+        warn "  s${S} (${NAME}) rep${rep}: could not copy tarball after 3 attempts."
       fi
     done
 
     if [ -f "$TARBALL" ]; then
       if [ -d "$REP_DIR" ]; then
-        log "  ${NAME} rep${rep}: ${REP_DIR} already exists — skipping extraction."
+        log "  s${S} (${NAME}) rep${rep}: ${REP_DIR} already exists — skipping extraction."
       else
         tar -xzf "$TARBALL" -C "$RESULTS_DIR" \
           && mv "${RESULTS_DIR}/${OUTDIR}" "$REP_DIR" \
-          && log "  ${NAME} rep${rep}: extracted → ${REP_DIR}" \
-          || warn "  ${NAME} rep${rep}: extraction/rename failed for ${TARBALL}"
+          && log "  s${S} (${NAME}) rep${rep}: extracted → ${REP_DIR}" \
+          || warn "  s${S} (${NAME}) rep${rep}: extraction/rename failed for ${TARBALL}"
       fi
       quick_stats "$REP_DIR" "$rep"
     fi
@@ -369,23 +255,22 @@ run_parallel_baselines() {
     LIVE_CONTAINERS=("${LIVE_CONTAINERS[@]/$CID/}")
   done
 
-  log "--- Parallel baselines done ---"
+  log "--- All MAB containers done ---"
   echo ""
 }
 
 # ---------------------------------------------------------------------------
-# Extract any tarballs not yet extracted (fallback — run_algo and
-# run_parallel_baselines extract immediately, so this is a safety net).
+# Extract any remaining tarballs
 # ---------------------------------------------------------------------------
 
 extract_remaining() {
   log "=== Extracting any remaining tarballs ==="
   local found_any=0
 
-  for entry in "${MAB_ALGOS[@]}" "${BASELINE_ALGOS[@]}"; do
+  for entry in "${MAB_ALGOS[@]}"; do
     local S="${entry%%:*}"
     local NAME="${entry##*:}"
-    local OUTDIR="out-1h-s${S}-${NAME}"
+    local OUTDIR="out-30m-s${S}-${NAME}"
 
     for i in $(seq 1 "$RUNS"); do
       local TARBALL="${RESULTS_DIR}/${OUTDIR}_${i}.tar.gz"
@@ -412,79 +297,75 @@ extract_remaining() {
 
 # ---------------------------------------------------------------------------
 # Summary table — one row per algorithm, aggregated over RUNS reps.
-# Columns: execs min/mean/max, paths min/mean/max, total crashes, mean mab_rounds
 # ---------------------------------------------------------------------------
 
 print_summary() {
-  log "=== Summary (${RUNS} reps per algorithm) ==="
-  printf "%-6s %-14s %22s %22s %8s %12s\n" \
-    "s" "Algorithm" "execs (min/mean/max)" "paths (min/mean/max)" "crashes" "mab_rounds"
-  printf "%-6s %-14s %22s %22s %8s %12s\n" \
-    "------" "--------------" "----------------------" "----------------------" "--------" "------------"
+  log "=== Summary (${RUNS} reps per algorithm, 30 min each) ==="
+  printf "%-6s %-14s %20s %20s %8s %12s\n" \
+    "s" "Algorithm" "execs (min/mean/max)" "paths (min/mean/max)" "crashes" "mab_pulls"
+  printf "%-6s %-14s %20s %20s %8s %12s\n" \
+    "------" "--------------" "--------------------" "--------------------" "--------" "------------"
 
-  for entry in "${MAB_ALGOS[@]}" "${BASELINE_ALGOS[@]}"; do
+  for entry in "${MAB_ALGOS[@]}"; do
     local S="${entry%%:*}"
     local NAME="${entry##*:}"
-    local OUTDIR="out-1h-s${S}-${NAME}"
+    local OUTDIR="out-30m-s${S}-${NAME}"
 
-    local -a execs_vals=() paths_vals=()
-    local crashes_sum=0 mab_sum=0 mab_count=0 rep_count=0
+    execs_vals=()
+    paths_vals=()
+    crashes_sum=0
+    mab_pulls=0
+    rep_count=0
 
     for i in $(seq 1 "$RUNS"); do
-      local REP_DIR="${RESULTS_DIR}/${OUTDIR}_${i}"
-      local statsfile="${REP_DIR}/fuzzer_stats"
-      local mabfile="${REP_DIR}/mab_stats"
+      REP_DIR="${RESULTS_DIR}/${OUTDIR}_${i}"
+      statsfile="${REP_DIR}/fuzzer_stats"
+      mabfile="${REP_DIR}/mab_stats"
 
       [ -f "$statsfile" ] || continue
       rep_count=$((rep_count + 1))
 
-      local e p c
-      e=$(grep "^execs_done"     "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
-      p=$(grep "^paths_total"    "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
-      c=$(grep "^unique_crashes" "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
-      execs_vals+=("${e:-0}")
-      paths_vals+=("${p:-0}")
-      crashes_sum=$((crashes_sum + ${c:-0}))
+      # Extract from fuzzer_stats
+      execs=$(grep "^execs_done"     "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
+      paths=$(grep "^paths_total"    "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
+      crashes=$(grep "^unique_crashes" "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
+      
+      execs_vals+=("${execs:-0}")
+      paths_vals+=("${paths:-0}")
+      crashes_sum=$((crashes_sum + ${crashes:-0}))
 
+      # Extract total pull_count from mab_stats if it exists
       if [ -f "$mabfile" ]; then
-        local mr
-        mr=$(grep -v '^#' "$mabfile" | grep -v '^mab' | grep -v '^timestamp' \
+        pulls=$(grep -v '^#' "$mabfile" | grep -v '^mab' | grep -v '^timestamp' \
           | awk 'NF>=6 {sum+=$3} END {print (sum>0?sum:"0")}')
-        mab_sum=$((mab_sum + ${mr:-0}))
-        mab_count=$((mab_count + 1))
+        mab_pulls=$((mab_pulls + ${pulls:-0}))
       fi
     done
 
     if [ "$rep_count" -eq 0 ]; then
-      printf "%-6s %-14s %22s %22s %8s %12s\n" \
+      printf "%-6s %-14s %20s %20s %8s %12s\n" \
         "s${S}" "$NAME" "N/A" "N/A" "N/A" "N/A"
       continue
     fi
 
-    local execs_stat paths_stat mab_mean
+    # Compute min/mean/max for execs and paths
     execs_stat=$(printf '%s\n' "${execs_vals[@]}" \
-      | awk 'BEGIN{mn=999999999;mx=0;sum=0;n=0}
-             {n++;sum+=$1; if($1<mn)mn=$1; if($1>mx)mx=$1}
-             END{printf "%d/%d/%d", mn, int(sum/n), mx}')
+      | awk 'BEGIN{min=999999999;max=0;sum=0;n=0}
+             {n++;sum+=$1; if($1<min)min=$1; if($1>max)max=$1}
+             END{printf "%d/%d/%d", min, int(sum/n), max}')
     paths_stat=$(printf '%s\n' "${paths_vals[@]}" \
-      | awk 'BEGIN{mn=999999999;mx=0;sum=0;n=0}
-             {n++;sum+=$1; if($1<mn)mn=$1; if($1>mx)mx=$1}
-             END{printf "%d/%d/%d", mn, int(sum/n), mx}')
+      | awk 'BEGIN{min=999999999;max=0;sum=0;n=0}
+             {n++;sum+=$1; if($1<min)min=$1; if($1>max)max=$1}
+             END{printf "%d/%d/%d", min, int(sum/n), max}')
 
-    if [ "$mab_count" -gt 0 ]; then
-      mab_mean=$(( mab_sum / mab_count ))
-    else
-      mab_mean="-"
-    fi
-
-    printf "%-6s %-14s %22s %22s %8s %12s\n" \
-      "s${S}" "$NAME" "$execs_stat" "$paths_stat" "$crashes_sum" "$mab_mean"
+    printf "%-6s %-14s %20s %20s %8s %12s\n" \
+      "s${S}" "$NAME" "$execs_stat" "$paths_stat" "$crashes_sum" "$mab_pulls"
   done
   echo ""
 }
 
 # ---------------------------------------------------------------------------
-# Render IPSM PNGs — one per rep
+# Render IPSM PNGs
 # ---------------------------------------------------------------------------
 
 render_ipsm() {
@@ -494,10 +375,10 @@ render_ipsm() {
   fi
 
   log "=== Rendering IPSM graphs ==="
-  for entry in "${MAB_ALGOS[@]}" "${BASELINE_ALGOS[@]}"; do
+  for entry in "${MAB_ALGOS[@]}"; do
     local S="${entry%%:*}"
     local NAME="${entry##*:}"
-    local OUTDIR="out-1h-s${S}-${NAME}"
+    local OUTDIR="out-30m-s${S}-${NAME}"
 
     for i in $(seq 1 "$RUNS"); do
       local REP_DIR="${RESULTS_DIR}/${OUTDIR}_${i}"
@@ -524,7 +405,7 @@ verify_mab_outputs() {
   for entry in "${MAB_ALGOS[@]}"; do
     local S="${entry%%:*}"
     local NAME="${entry##*:}"
-    local OUTDIR="out-1h-s${S}-${NAME}"
+    local OUTDIR="out-30m-s${S}-${NAME}"
     local algo_ok=1
 
     for i in $(seq 1 "$RUNS"); do
@@ -559,11 +440,13 @@ verify_mab_outputs() {
 # ---------------------------------------------------------------------------
 
 log "======================================================"
-log "  run_1h_pilots.sh  —  $(date)"
+log "  run_30min_mab_parallel.sh  —  $(date)"
 log "======================================================"
 log "  Image:          $IMAGE"
 log "  Runs per algo:  $RUNS"
-log "  Timeout/run:    ${TIMEOUT}s"
+log "  Timeout/run:    ${TIMEOUT}s (30 minutes)"
+log "  Total algos:    ${#MAB_ALGOS[@]}"
+log "  Total containers: $(( ${#MAB_ALGOS[@]} * RUNS ))"
 log "  Results dir:    $RESULTS_DIR"
 log "  Log file:       $LOG_FILE"
 log "======================================================"
@@ -571,31 +454,18 @@ echo ""
 
 preflight
 
-# ── Phase 1: MAB algorithms — one algo at a time, RUNS reps in parallel ──────
+# ── Main execution: All MAB algorithms in parallel ────────────────────────
 
-log "====== Phase 1: MAB algorithms (sequential per algo, ${RUNS} reps parallel) ======"
+log "====== Running all MAB algorithms in parallel ======"
 log "  Algorithms: ${MAB_ALGOS[*]}"
-log "  Estimated wall time: ~$((${#MAB_ALGOS[@]} * TIMEOUT / 3600))h"
+log "  Estimated wall time: ~30 min + post-run overhead"
 echo ""
 
-for entry in "${MAB_ALGOS[@]}"; do
-  S="${entry%%:*}"
-  NAME="${entry##*:}"
-  run_algo "$S" "$NAME"
-done
+run_all_parallel
 
-# ── Phase 2: Baselines — all RUNS×3 containers in parallel ───────────────────
+# ── Post-processing ────────────────────────────────────────────────────────
 
-log "====== Phase 2: Baselines (all ${#BASELINE_ALGOS[@]} algos x ${RUNS} reps in parallel) ======"
-log "  Algorithms: ${BASELINE_ALGOS[*]}"
-log "  Estimated wall time: ~$((TIMEOUT / 3600))h"
-echo ""
-
-run_parallel_baselines
-
-# ── Phase 3: Post-processing ──────────────────────────────────────────────────
-
-log "====== Phase 3: Post-processing ======"
+log "====== Post-processing ======"
 
 extract_remaining
 print_summary
