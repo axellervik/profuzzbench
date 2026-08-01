@@ -1,11 +1,12 @@
 #!/bin/bash
 # run_1h_mab_diagnostic.sh — 1-hour MAB-only diagnostic pilot
 #                            10 repetitions per algorithm, sequential algorithms
-#                            (validates the reallocation fix)
+# Validates: UCB1 (-s 8), Thompson Sampling (-s 9), per-execution reward,
+#            warm-start arm weights, and sleep window calibration.
 #
 # Phase 1 (sequential per algo, parallel within):
 #   MAB algorithms s4..s7, one algo at a time, 10 containers in parallel each.
-#   (~4 h total wall time, 10 cores per algo)
+#   (~6 h total wall time, 10 cores per algo)
 #
 # Phase 2 (post-processing):
 #   Extract tarballs, print summary table, render IPSM PNGs, verify MAB outputs.
@@ -37,7 +38,16 @@ IMAGE="openssl-mabflnet"
 COMMON_OPTS="-P TLS -D 10000 -q 3 -E -K -R -W 100"
 MIN_DISK_MB=5120                      # refuse to start a phase if < 5 GB free
 CONTAINER_START_WAIT=15               # seconds to wait before liveness check
-RESULTS_DIR="${RESULTS}/1h-mab-diagnostic"
+# Auto-increment results directory: 1h-mab-diagnostic, -2, -3, ...
+_base="${RESULTS}/1h-mab-diagnostic"
+if [ ! -d "$_base" ]; then
+  RESULTS_DIR="$_base"
+else
+  _n=2
+  while [ -d "${_base}-${_n}" ]; do _n=$((_n + 1)); done
+  RESULTS_DIR="${_base}-${_n}"
+fi
+unset _base _n
 LOG_FILE="${RESULTS_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
 
 MAB_ALGOS=(
@@ -45,6 +55,8 @@ MAB_ALGOS=(
   "5:EXP3-IX"
   "6:SB-EXP3"
   "7:SB-EXP3-IX"
+  "8:UCB1"
+  "9:THOMPSON"
 )
 
 # ---------------------------------------------------------------------------
@@ -122,7 +134,7 @@ preflight() {
 
   log "  Runs per algorithm: $RUNS"
   log "  Timeout per run:    ${TIMEOUT}s"
-  log "  Total wall time:    ~$(( (RUNS + RUNS + RUNS + RUNS) / 10 ))h (4 algos × 10 parallel)"
+  log "  Total wall time:    ~$(( ${#MAB_ALGOS[@]} * TIMEOUT / 3600 ))h (${#MAB_ALGOS[@]} algos × ${RUNS} parallel)"
   log "=== Pre-flight OK ==="
   echo ""
 }
@@ -156,20 +168,21 @@ quick_stats() {
     return
   fi
 
-  local execs paths crashes mab_pulls
+  local execs paths crashes mab_rounds
   execs=$(grep   "^execs_done"     "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
   paths=$(grep   "^paths_total"    "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
   crashes=$(grep "^unique_crashes" "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
 
   if [ -f "$mabfile" ]; then
-    # Extract total pull_count from all rows (sum of field 3)
-    mab_pulls=$(awk 'NR>3 && NF>=3 {sum+=$3} END {print sum}' "$mabfile")
-    if [ -z "$mab_pulls" ]; then mab_pulls="0"; fi
+    # Maximum last_selected value across all data rows = total MAB rounds fired
+    mab_rounds=$(awk '!/^mab/ && !/^timestamp/ && !/^#/ && !/^[[:space:]]*$/ && NF>=6 \
+      {if($6+0 > max) max=$6+0} END {print (max>0?max:"0")}' "$mabfile")
+    if [ -z "$mab_rounds" ]; then mab_rounds="0"; fi
   else
-    mab_pulls="-"
+    mab_rounds="-"
   fi
 
-  log "    rep${rep}: execs=${execs} paths=${paths} crashes=${crashes} mab_pulls=${mab_pulls}"
+  log "    rep${rep}: execs=${execs} paths=${paths} crashes=${crashes} mab_rounds=${mab_rounds}"
 }
 
 # ---------------------------------------------------------------------------
@@ -358,7 +371,7 @@ verify_mab_outputs() {
       local REP_DIR="${RESULTS_DIR}/${OUTDIR}_${i}"
 
       if [ -d "$REP_DIR" ]; then
-        for file in mab_stats mab_reward_log mab_seed_map; do
+        for file in mab_stats mab_reward_log; do
           if [ -f "${REP_DIR}/${file}" ]; then
             found=$((found + 1))
           else
@@ -382,28 +395,61 @@ verify_mab_outputs() {
 print_summary() {
   log "=== Summary table ==="
   log ""
-  log "Algorithm    Rep   Execs    Paths  Crashes  MAB_Pulls"
-  log "--------- ------- -------- --------- --------- ----------"
+  printf "%-6s %-14s %22s %22s %8s %12s\n" \
+    "s" "Algorithm" "execs (min/mean/max)" "paths (min/mean/max)" "crashes" "mab_rounds"
+  printf "%-6s %-14s %22s %22s %8s %12s\n" \
+    "------" "--------------" "----------------------" "----------------------" "--------" "------------"
 
   for entry in "${MAB_ALGOS[@]}"; do
     local S="${entry%%:*}"
     local NAME="${entry##*:}"
     local OUTDIR="out-1h-mab-s${S}-${NAME}"
 
+    local -a execs_vals=() paths_vals=()
+    local crashes_sum=0 mab_rounds=0 rep_count=0
+
     for i in $(seq 1 "$RUNS"); do
       local REP_DIR="${RESULTS_DIR}/${OUTDIR}_${i}"
-      if [ -f "${REP_DIR}/fuzzer_stats" ]; then
-        local execs=$(grep "^execs_done" "${REP_DIR}/fuzzer_stats" | awk -F': ' '{print $2}' | tr -d ' ')
-        local paths=$(grep "^paths_total" "${REP_DIR}/fuzzer_stats" | awk -F': ' '{print $2}' | tr -d ' ')
-        local crashes=$(grep "^unique_crashes" "${REP_DIR}/fuzzer_stats" | awk -F': ' '{print $2}' | tr -d ' ')
-        local mab_pulls=0
-        if [ -f "${REP_DIR}/mab_stats" ]; then
-          mab_pulls=$(awk 'NR>3 && NF>=3 {sum+=$3} END {print sum}' "${REP_DIR}/mab_stats")
-          if [ -z "$mab_pulls" ]; then mab_pulls="0"; fi
-        fi
-        printf "%-10s %3d %9s %9s %9s %11s\n" "$NAME" "$i" "$execs" "$paths" "$crashes" "$mab_pulls"
+      local statsfile="${REP_DIR}/fuzzer_stats"
+      local mabfile="${REP_DIR}/mab_stats"
+
+      [ -f "$statsfile" ] || continue
+      rep_count=$((rep_count + 1))
+
+      local e p c
+      e=$(grep "^execs_done"     "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
+      p=$(grep "^paths_total"    "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
+      c=$(grep "^unique_crashes" "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
+      execs_vals+=("${e:-0}")
+      paths_vals+=("${p:-0}")
+      crashes_sum=$((crashes_sum + ${c:-0}))
+
+      if [ -f "$mabfile" ]; then
+        local rounds
+        rounds=$(awk '!/^mab/ && !/^timestamp/ && !/^#/ && !/^[[:space:]]*$/ && NF>=6 \
+          {if($6+0 > max) max=$6+0} END {print (max>0?max:"0")}' "$mabfile")
+        mab_rounds=$((mab_rounds + ${rounds:-0}))
       fi
     done
+
+    if [ "$rep_count" -eq 0 ]; then
+      printf "%-6s %-14s %22s %22s %8s %12s\n" \
+        "s${S}" "$NAME" "N/A" "N/A" "N/A" "N/A"
+      continue
+    fi
+
+    local execs_stat paths_stat
+    execs_stat=$(printf '%s\n' "${execs_vals[@]}" \
+      | awk 'BEGIN{mn=999999999;mx=0;sum=0;n=0}
+             {n++;sum+=$1; if($1<mn)mn=$1; if($1>mx)mx=$1}
+             END{printf "%d/%d/%d", mn, int(sum/n), mx}')
+    paths_stat=$(printf '%s\n' "${paths_vals[@]}" \
+      | awk 'BEGIN{mn=999999999;mx=0;sum=0;n=0}
+             {n++;sum+=$1; if($1<mn)mn=$1; if($1>mx)mx=$1}
+             END{printf "%d/%d/%d", mn, int(sum/n), mx}')
+
+    printf "%-6s %-14s %22s %22s %8s %12s\n" \
+      "s${S}" "$NAME" "$execs_stat" "$paths_stat" "$crashes_sum" "$mab_rounds"
   done
 
   log ""
@@ -417,7 +463,7 @@ print_summary() {
 
 main() {
   log "======================================================================"
-  log "1h MAB Diagnostic Pilot (MAB-only, reallocation fix validation)"
+  log "1h MAB Diagnostic Pilot (UCB1 / Thompson / per-execution reward validation)"
   log "======================================================================"
   echo ""
 

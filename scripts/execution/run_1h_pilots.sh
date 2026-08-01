@@ -3,8 +3,8 @@
 #                    10 repetitions per algorithm (matches production)
 #
 # Phase 1 (sequential per algo, parallel within):
-#   MAB algorithms s4..s7, one algo at a time, 10 containers in parallel each.
-#   (~4 h total wall time, 10 cores per algo)
+#   MAB algorithms s4..s9, one algo at a time, 10 containers in parallel each.
+#   (~6 h total wall time, 10 cores per algo)
 #
 # Phase 2 (all parallel):
 #   Baselines s1, s2, s3 — all 30 containers launched simultaneously.
@@ -48,6 +48,8 @@ MAB_ALGOS=(
   "5:EXP3-IX"
   "6:SB-EXP3"
   "7:SB-EXP3-IX"
+  "8:UCB1"
+  "9:THOMPSON"
 )
 
 BASELINE_ALGOS=(
@@ -170,8 +172,10 @@ quick_stats() {
   crashes=$(grep "^unique_crashes" "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
 
   if [ -f "$mabfile" ]; then
-    mab_rounds=$(grep -v '^#' "$mabfile" | grep -v '^mab' | grep -v '^timestamp' \
-      | awk 'NF>=6 {if($6+0 > max) max=$6+0} END {print (max>0?max:"0")}')
+    # Maximum last_selected value across all data rows = total MAB rounds fired
+    mab_rounds=$(awk '!/^mab/ && !/^timestamp/ && !/^#/ && !/^[[:space:]]*$/ && NF>=6 \
+      {if($6+0 > max) max=$6+0} END {print (max>0?max:"0")}' "$mabfile")
+    if [ -z "$mab_rounds" ]; then mab_rounds="0"; fi
   else
     mab_rounds="-"
   fi
@@ -428,7 +432,7 @@ print_summary() {
     local OUTDIR="out-1h-s${S}-${NAME}"
 
     local -a execs_vals=() paths_vals=()
-    local crashes_sum=0 mab_sum=0 mab_count=0 rep_count=0
+    local crashes_sum=0 mab_rounds=0 rep_count=0
 
     for i in $(seq 1 "$RUNS"); do
       local REP_DIR="${RESULTS_DIR}/${OUTDIR}_${i}"
@@ -447,11 +451,10 @@ print_summary() {
       crashes_sum=$((crashes_sum + ${c:-0}))
 
       if [ -f "$mabfile" ]; then
-        local mr
-        mr=$(grep -v '^#' "$mabfile" | grep -v '^mab' | grep -v '^timestamp' \
-          | awk 'NF>=6 {sum+=$3} END {print (sum>0?sum:"0")}')
-        mab_sum=$((mab_sum + ${mr:-0}))
-        mab_count=$((mab_count + 1))
+        local rounds
+        rounds=$(awk '!/^mab/ && !/^timestamp/ && !/^#/ && !/^[[:space:]]*$/ && NF>=6 \
+          {if($6+0 > max) max=$6+0} END {print (max>0?max:"0")}' "$mabfile")
+        mab_rounds=$((mab_rounds + ${rounds:-0}))
       fi
     done
 
@@ -461,7 +464,7 @@ print_summary() {
       continue
     fi
 
-    local execs_stat paths_stat mab_mean
+    local execs_stat paths_stat
     execs_stat=$(printf '%s\n' "${execs_vals[@]}" \
       | awk 'BEGIN{mn=999999999;mx=0;sum=0;n=0}
              {n++;sum+=$1; if($1<mn)mn=$1; if($1>mx)mx=$1}
@@ -471,14 +474,8 @@ print_summary() {
              {n++;sum+=$1; if($1<mn)mn=$1; if($1>mx)mx=$1}
              END{printf "%d/%d/%d", mn, int(sum/n), mx}')
 
-    if [ "$mab_count" -gt 0 ]; then
-      mab_mean=$(( mab_sum / mab_count ))
-    else
-      mab_mean="-"
-    fi
-
     printf "%-6s %-14s %22s %22s %8s %12s\n" \
-      "s${S}" "$NAME" "$execs_stat" "$paths_stat" "$crashes_sum" "$mab_mean"
+      "s${S}" "$NAME" "$execs_stat" "$paths_stat" "$crashes_sum" "$mab_rounds"
   done
   echo ""
 }
@@ -516,7 +513,7 @@ render_ipsm() {
 }
 
 # ---------------------------------------------------------------------------
-# Verify mab_reward_log, mab_stats, mab_seed_map for all MAB reps
+# Verify mab_reward_log, mab_stats for all MAB reps
 # ---------------------------------------------------------------------------
 
 verify_mab_outputs() {
@@ -531,7 +528,7 @@ verify_mab_outputs() {
       local REP_DIR="${RESULTS_DIR}/${OUTDIR}_${i}"
       local rep_ok=1
 
-      for f in mab_reward_log mab_stats mab_seed_map; do
+      for f in mab_reward_log mab_stats; do
         if [ -f "${REP_DIR}/${f}" ]; then
           local lines
           lines=$(wc -l < "${REP_DIR}/${f}")

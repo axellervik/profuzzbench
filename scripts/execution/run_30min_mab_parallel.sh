@@ -1,7 +1,7 @@
 #!/bin/bash
 # run_30min_mab_parallel.sh — 30-minute MAB validation pilots
 #
-# All 4 MAB algorithms run 10 repetitions in parallel (40 containers total).
+# All 6 MAB algorithms run 10 repetitions in parallel (60 containers total).
 # Each run is 30 minutes (1800 seconds). Total wall time: ~30 minutes.
 #
 # Designed to run unsupervised. All output is tee'd to a timestamped log file.
@@ -39,6 +39,8 @@ MAB_ALGOS=(
   "5:EXP3-IX"
   "6:SB-EXP3"
   "7:SB-EXP3-IX"
+  "8:UCB1"
+  "9:THOMPSON"
 )
 
 # ---------------------------------------------------------------------------
@@ -144,19 +146,20 @@ quick_stats() {
     return
   fi
 
-  local execs paths crashes mab_pulls
+  local execs paths crashes mab_rounds
   execs=$(grep   "^execs_done"     "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
   paths=$(grep   "^paths_total"    "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
   crashes=$(grep "^unique_crashes" "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
 
   if [ -f "$mabfile" ]; then
-    mab_pulls=$(grep -v '^#' "$mabfile" | grep -v '^mab' | grep -v '^timestamp' \
-      | awk 'NF>=6 {sum+=$3} END {print (sum>0?sum:"0")}')
+    mab_rounds=$(awk '!/^mab/ && !/^timestamp/ && !/^#/ && !/^[[:space:]]*$/ && NF>=6 \
+      {if($6+0 > max) max=$6+0} END {print (max>0?max:"0")}' "$mabfile")
+    if [ -z "$mab_rounds" ]; then mab_rounds="0"; fi
   else
-    mab_pulls="-"
+    mab_rounds="-"
   fi
 
-  log "    rep${rep}: execs=${execs} paths=${paths} crashes=${crashes} mab_pulls=${mab_pulls}"
+  log "    rep${rep}: execs=${execs} paths=${paths} crashes=${crashes} mab_rounds=${mab_rounds}"
 }
 
 # ---------------------------------------------------------------------------
@@ -302,7 +305,7 @@ extract_remaining() {
 print_summary() {
   log "=== Summary (${RUNS} reps per algorithm, 30 min each) ==="
   printf "%-6s %-14s %20s %20s %8s %12s\n" \
-    "s" "Algorithm" "execs (min/mean/max)" "paths (min/mean/max)" "crashes" "mab_pulls"
+    "s" "Algorithm" "execs (min/mean/max)" "paths (min/mean/max)" "crashes" "mab_rounds"
   printf "%-6s %-14s %20s %20s %8s %12s\n" \
     "------" "--------------" "--------------------" "--------------------" "--------" "------------"
 
@@ -314,7 +317,7 @@ print_summary() {
     execs_vals=()
     paths_vals=()
     crashes_sum=0
-    mab_pulls=0
+    mab_rounds=0
     rep_count=0
 
     for i in $(seq 1 "$RUNS"); do
@@ -334,11 +337,11 @@ print_summary() {
       paths_vals+=("${paths:-0}")
       crashes_sum=$((crashes_sum + ${crashes:-0}))
 
-      # Extract total pull_count from mab_stats if it exists
+      # Extract max mab_round from mab_stats if it exists (max last_selected, field 6)
       if [ -f "$mabfile" ]; then
-        pulls=$(grep -v '^#' "$mabfile" | grep -v '^mab' | grep -v '^timestamp' \
-          | awk 'NF>=6 {sum+=$3} END {print (sum>0?sum:"0")}')
-        mab_pulls=$((mab_pulls + ${pulls:-0}))
+        rounds=$(awk '!/^mab/ && !/^timestamp/ && !/^#/ && !/^[[:space:]]*$/ && NF>=6 \
+          {if($6+0 > max) max=$6+0} END {print (max>0?max:"0")}' "$mabfile")
+        mab_rounds=$((mab_rounds + ${rounds:-0}))
       fi
     done
 
@@ -359,7 +362,7 @@ print_summary() {
              END{printf "%d/%d/%d", min, int(sum/n), max}')
 
     printf "%-6s %-14s %20s %20s %8s %12s\n" \
-      "s${S}" "$NAME" "$execs_stat" "$paths_stat" "$crashes_sum" "$mab_pulls"
+      "s${S}" "$NAME" "$execs_stat" "$paths_stat" "$crashes_sum" "$mab_rounds"
   done
   echo ""
 }
@@ -397,7 +400,7 @@ render_ipsm() {
 }
 
 # ---------------------------------------------------------------------------
-# Verify mab_reward_log, mab_stats, mab_seed_map for all MAB reps
+# Verify mab_reward_log, mab_stats for all MAB reps
 # ---------------------------------------------------------------------------
 
 verify_mab_outputs() {
@@ -412,7 +415,7 @@ verify_mab_outputs() {
       local REP_DIR="${RESULTS_DIR}/${OUTDIR}_${i}"
       local rep_ok=1
 
-      for f in mab_reward_log mab_stats mab_seed_map; do
+      for f in mab_reward_log mab_stats; do
         if [ -f "${REP_DIR}/${f}" ]; then
           local lines
           lines=$(wc -l < "${REP_DIR}/${f}")
