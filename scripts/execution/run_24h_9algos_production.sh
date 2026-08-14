@@ -328,6 +328,22 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: $*" >&2; }
 die()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] FATAL: $*" >&2; exit 1; }
 
+# Human-readable duration formatter — used instead of naive "/ 60" or
+# "/ 3600" so smoke-test-scale values (e.g. 20s, 40s) don't misleadingly
+# print as "0 min"/"~0h" in the log. Picks whichever unit best represents
+# the value: seconds if < 60, minutes if < 3600, hours otherwise.
+# Usage: fmt_duration SECONDS
+fmt_duration() {
+  local secs="$1"
+  if [ "$secs" -lt 60 ]; then
+    echo "${secs}s"
+  elif [ "$secs" -lt 3600 ]; then
+    echo "$((secs / 60))min"
+  else
+    echo "$((secs / 3600))h"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Persistent run-state file (reboot-resume support)
 # ---------------------------------------------------------------------------
@@ -436,10 +452,10 @@ preflight() {
 
   log "  Algorithms:          ${#ALL_ALGOS[@]} (sequential, fixed priority order)"
   log "  Reps per algorithm:  $RUNS (parallel)"
-  log "  Timeout per run:     ${TIMEOUT}s (~$((TIMEOUT / 3600))h)"
-  log "  Health/disk re-check every: $((POLL_INTERVAL / 60)) min"
-  log "  Auto-restart window: $((EARLY_FAILURE_WINDOW / 60)) min (one attempt per rep)"
-  log "  Estimated wall time: ~$(( (TIMEOUT * ${#ALL_ALGOS[@]}) / 3600 ))h (${#ALL_ALGOS[@]} algorithms, nominal; real-world runs have historically overrun by up to ~1h35m per 24h batch)"
+  log "  Timeout per run:     ${TIMEOUT}s (~$(fmt_duration "$TIMEOUT"))"
+  log "  Health/disk re-check every: $(fmt_duration "$POLL_INTERVAL")"
+  log "  Auto-restart window: $(fmt_duration "$EARLY_FAILURE_WINDOW") (one attempt per rep)"
+  log "  Estimated wall time: ~$(fmt_duration "$(( TIMEOUT * ${#ALL_ALGOS[@]} ))") (${#ALL_ALGOS[@]} algorithms, nominal; real-world runs have historically overrun by up to ~1h35m per 24h batch)"
   log "=== Pre-flight OK ==="
   echo ""
 }
@@ -665,7 +681,7 @@ run_algo_single() {
 
   # Poll until all reps have stopped, re-checking health and disk every
   # POLL_INTERVAL seconds, and auto-restarting reps that die early.
-  log "  Waiting for all ${RUNS} reps to finish (~$((TIMEOUT / 3600))h, polling every $((POLL_INTERVAL / 60)) min)..."
+  log "  Waiting for all ${RUNS} reps to finish (~$(fmt_duration "$TIMEOUT"), polling every $(fmt_duration "$POLL_INTERVAL"))..."
   local pending=$RUNS
   while [ "$pending" -gt 0 ]; do
     sleep "$POLL_INTERVAL"
@@ -687,7 +703,7 @@ run_algo_single() {
       local elapsed=$(( $(date +%s) - start_ts ))
 
       if [ "$elapsed" -lt "$EARLY_FAILURE_WINDOW" ] && [ -z "${cid_restarted[$CID]:-}" ]; then
-        warn "  rep${i}: container ${CID} died after ${elapsed}s (< $((EARLY_FAILURE_WINDOW / 60)) min) — auto-restarting (one attempt)."
+        warn "  rep${i}: container ${CID} died after ${elapsed}s (< $(fmt_duration "$EARLY_FAILURE_WINDOW")) — auto-restarting (one attempt)."
         docker logs --tail 30 "$CID" 2>&1 | while IFS= read -r line; do warn "    $line"; done
         docker rm "$CID" >/dev/null 2>&1 || true
         LIVE_CONTAINERS=("${LIVE_CONTAINERS[@]/$CID/}")
@@ -1011,8 +1027,8 @@ main() {
   log "Order: ${ALL_ALGOS[*]}"
   log "Reps per algorithm (parallel): $RUNS"
   log "Timeout per algorithm: ${TIMEOUT}s"
-  log "Robustness: periodic health checks every $((POLL_INTERVAL / 60)) min,"
-  log "bounded auto-restart (< $((EARLY_FAILURE_WINDOW / 60)) min elapsed, one"
+  log "Robustness: periodic health checks every $(fmt_duration "$POLL_INTERVAL"),"
+  log "bounded auto-restart (< $(fmt_duration "$EARLY_FAILURE_WINDOW") elapsed, one"
   log "attempt per rep), continuous non-fatal disk monitoring, persistent"
   log "run-state file for algorithm-granular resume after interruption."
   log "======================================================================"
