@@ -647,9 +647,10 @@ run_algo_single() {
   check_disk "s${S} (${NAME})"
   write_state "launching" "$ALGO_KEY"
 
-  local -A rep_cid=()       # rep index -> current container id
-  local -A cid_start_ts=()  # container id -> epoch seconds when launched
-  local -A cid_restarted=() # container id -> 1 once it has used its one restart
+  local -A rep_cid=()        # rep index -> current container id
+  local -A cid_start_ts=()   # container id -> epoch seconds when launched
+  local -A cid_restarted=()  # container id -> 1 once it has used its one restart
+  local -A cid_logged_done=() # container id -> 1 once "finished/stopped" has been logged for it
 
   # Launch all RUNS containers
   local i
@@ -720,7 +721,16 @@ run_algo_single() {
         log "  rep${i}: restarted as container ${NEW_CID}"
         pending=$((pending + 1))
       else
-        log "  rep${i}: container ${CID} finished/stopped after ${elapsed}s — treated as complete."
+        # Log "finished/stopped" only once per rep — without this guard the
+        # container is re-detected as stopped (correctly) on every remaining
+        # poll cycle of this algorithm's wait and spams the log/re-runs
+        # `docker inspect` for no reason. rep_cid[$i] is intentionally left
+        # intact (not cleared) since the extraction step below still needs
+        # it to `docker cp` the finished container's tarball.
+        if [ -z "${cid_logged_done[$CID]:-}" ]; then
+          log "  rep${i}: container ${CID} finished/stopped after ${elapsed}s — treated as complete."
+          cid_logged_done[$CID]=1
+        fi
       fi
     done
     log "  Still running: ${pending}/${RUNS}"
