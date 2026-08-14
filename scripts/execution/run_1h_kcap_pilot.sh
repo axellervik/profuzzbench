@@ -1,40 +1,48 @@
 #!/bin/bash
-# run_1h_sb_asleep_fix_pilot.sh — 1-hour pilot, SLEEPING_BANDIT and
-#                                  SLEEPING_BANDIT_IX only, 10 reps in
-#                                  parallel per algorithm, algorithms run
-#                                  sequentially.
+# run_1h_kcap_pilot.sh — 1-hour pilot, EXP3 / EXP3-IX / SLEEPING_BANDIT /
+#                         SLEEPING_BANDIT_IX / UCB1 / THOMPSON_SAMPLING,
+#                         10 reps in parallel per algorithm, algorithms
+#                         run sequentially.
 #
-# Validates mab_seed_asleep() in afl-fuzz.c: initial seeds' favored bit
-# can go 0->1 but never back to 0 (cull_queue() only clears favored for
-# non-initial seeds), so gating "asleep" on !favored kept an initial seed
-# permanently awake once favored even once. mab_seed_asleep() uses
-# was_fuzzed && queue_cycle > 1 alone for initial seeds instead.
+# Validates mab_cap_seeds() in afl-fuzz.c: caps each state's seed/arm pool
+# at MAX_SEEDS_PER_STATE (30), evicting the lowest-performing arm (never
+# the one in flight this round) once the cap is exceeded.
 #
-# Follow-up to 1h-ix-lockin-fix (gamma_ix floor fix). Only the 2
-# sleeping-bandit algorithms are re-run since EXP3/EXP3-IX don't use
-# awake/asleep at all.
+# The first 4 algorithms need a fresh baseline anyway (their prior runs
+# predate the percentile-rank reward fix), so this pilot triple-duties
+# as: K-cap validation, sleeping-bandit asleep-predicate re-validation,
+# and a non-stale baseline. UCB1 and Thompson Sampling are included
+# opportunistically to get fresh K-cap data on them too.
 #
 # Layout:
-#   Algorithm 1: SLEEPING_BANDIT     (-s 6) — 10 reps in parallel (~1h)
-#   Algorithm 2: SLEEPING_BANDIT_IX  (-s 7) — 10 reps in parallel (~1h)
-# Algorithms run sequentially — total wall time ~2h.
+#   s4 EXP3              — 10 reps in parallel (~1h)
+#   s5 EXP3-IX           — 10 reps in parallel (~1h)
+#   s6 SLEEPING_BANDIT   — 10 reps in parallel (~1h)
+#   s7 SLEEPING_BANDIT_IX— 10 reps in parallel (~1h)
+#   s8 UCB1              — 10 reps in parallel (~1h)
+#   s9 THOMPSON_SAMPLING — 10 reps in parallel (~1h)
+# Algorithms run sequentially — total wall time ~6h.
 #
-# Expected: SB-EXP3-IX's top_pct/gini should drop from 1h-ix-lockin-fix's
-# post-gamma_ix-fix values (top_pct mean 22.6%, gini mean 0.856) toward
-# that pilot's non-sleeping EXP3-IX baseline (top_pct mean 10.3%).
-# SLEEPING_BANDIT (non-IX) should change little (uniform-mixing floor
-# already bounded this).
-#
-# Prints per-rep top-arm pull share, Gini coefficient, and arm-0-is-top
-# rate (see lockin_stats/arm0_check) so the fix can be judged without a
-# separate offline pass; full offline analysis should still follow.
+# Checks printed per rep and aggregated in the summary:
+#   - crashes (should be 0 unless a real bug is found)
+#   - mab_rounds (sanity: round rate not badly disrupted by eviction work)
+#   - zero_pct/sat_pct (reward composition sanity, carried over)
+#   - state 0 arm count (should be capped at 30 once seeds_count exceeds it)
+#   - eviction count (duplicate arm_idx rows in mab_seed_map for state 0)
+#   - arm discriminability: coefficient of variation of cumul_reward/
+#     pull_count across pulled arms in state 0
+#   - reward-log anomaly count: zero/negative/NaN reward rows anywhere in
+#     the log (coarse proxy only — mab_seed_map has no timestamp column,
+#     so exact correlation with eviction events isn't possible; a nonzero
+#     eviction count alongside a nonzero anomaly count warrants a manual
+#     look, but the script does not attempt to line them up in time)
 #
 # Designed to run unsupervised. Output tee'd to a timestamped log file.
 # Traps SIGINT/SIGTERM and cleans up live containers before exit.
 #
 # Prerequisites:
 #   source ~/fuzz/profuzzbench/fuzz-env.sh
-#   bash run_1h_sb_asleep_fix_pilot.sh
+#   bash run_1h_kcap_pilot.sh
 #
 # Required env vars (set by fuzz-env.sh):
 #   PFBENCH   — path to profuzzbench repo  (e.g. ~/fuzz/profuzzbench)
@@ -52,13 +60,13 @@ set -euo pipefail
 RUNS=10                               # repetitions per algorithm (parallel)
 TIMEOUT=3600                          # 1 hour per run
 SKIPCOUNT=5                           # gcovr every 5 seeds
-IMAGE="openssl-mabflnet"
+IMAGE="openssl-mabflnet-kcap"
 COMMON_OPTS="-P TLS -D 10000 -q 3 -E -K -R -W 100"
 MIN_DISK_MB=5120                      # refuse to start if < 5 GB free (10 x ~500MB per algo)
 CONTAINER_START_WAIT=15               # seconds before liveness check
 
-# Auto-increment results directory: 1h-sb-asleep-fix, -2, -3, ...
-_base="${RESULTS}/1h-sb-asleep-fix"
+# Auto-increment results directory: 1h-kcap-6mab-10runs, -2, -3, ...
+_base="${RESULTS}/1h-kcap-6mab-10runs"
 if [ ! -d "$_base" ]; then
   RESULTS_DIR="$_base"
 else
@@ -69,11 +77,18 @@ fi
 unset _base _n
 LOG_FILE="${RESULTS_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
 
-# Only the 2 sleeping-bandit algorithms, run sequentially in this order
+# 4 algorithms needing a fresh baseline + UCB1/Thompson opportunistically,
+# run sequentially in this order
 MAB_ALGOS=(
-  "6:SB-EXP3"
-  "7:SB-EXP3-IX"
+  "4:EXP3"
+  "5:EXP3-IX"
+  "6:SLEEPING_BANDIT"
+  "7:SLEEPING_BANDIT_IX"
+  "8:UCB1"
+  "9:THOMPSON_SAMPLING"
 )
+
+MAX_SEEDS_PER_STATE=30                # must match config.h
 
 # ---------------------------------------------------------------------------
 # Logging helper — every echo goes to both stdout and the log file
@@ -124,7 +139,7 @@ preflight() {
 
   # Image exists
   docker image inspect "$IMAGE" &>/dev/null \
-    || die "Docker image '$IMAGE' not found. Build it first (must include mab_seed_asleep() in afl-fuzz.c)."
+    || die "Docker image '$IMAGE' not found. Build it first (must include mab_cap_seeds() in afl-fuzz.c)."
   log "  Image '$IMAGE': found"
 
   # Required env vars
@@ -163,96 +178,107 @@ check_disk() {
 }
 
 # ---------------------------------------------------------------------------
-# Compute, for one extracted rep directory's mab_stats file, the top-arm
-# pull share and Gini coefficient of pull_count across arms in state 0
-# (the state/metric used to originally detect the lock-in bug and its
-# residual arm-0 first-mover effect in the 1h-ix-lockin-fix pilot).
+# State 0's arm count and discriminability from mab_stats.
 #
 # mab_stats format (after an 8-line header block + 1 blank line + 1
 # column-header comment line):
 #   state_id  arm_idx  pull_count  log_weight  cumul_reward  last_selected
 #
-# Usage: lockin_stats MAB_STATS_FILE
-# Prints: "top_pct=<pct> gini=<val> arms_pulled=<n>/<total> max_pulls=<n>"
+# Usage: kcap_stats MAB_STATS_FILE
+# Prints: "arms=<n> capped=<yes|no> cov=<val> arms_pulled=<n>"
+#   arms:    total arm rows for state 0 (should be <= MAX_SEEDS_PER_STATE)
+#   capped:  yes if arms == MAX_SEEDS_PER_STATE (cap is actively binding)
+#   cov:     coefficient of variation of cumul_reward/pull_count across
+#            pulled arms (higher = arms are more discriminable)
 # ---------------------------------------------------------------------------
 
-lockin_stats() {
+kcap_stats() {
   local mabstats="$1"
   if [ ! -f "$mabstats" ]; then
-    echo "top_pct=- gini=- arms_pulled=-/- max_pulls=-"
+    echo "arms=- capped=- cov=- arms_pulled=-"
     return
   fi
 
-  awk '
+  awk -v cap="$MAX_SEEDS_PER_STATE" '
     BEGIN { in_data = 0 }
     /^# state_id/ { in_data = 1; next }
-    in_data && NF >= 3 && $1 == 0 { pulls[NR] = $3; total_pulls += $3; n_arms++; if ($3 > 0) n_pulled++ }
+    in_data && NF >= 5 && $1 == 0 {
+      n_arms++
+      if ($3 > 0) {
+        avg = $5 / $3
+        avgs[n_pulled] = avg
+        n_pulled++
+        sum += avg
+      }
+    }
     END {
-      if (n_arms == 0 || total_pulls == 0) {
-        print "top_pct=0.0 gini=0.000 arms_pulled=0/0 max_pulls=0"
+      capped = (n_arms >= cap) ? "yes" : "no"
+      if (n_pulled < 2) {
+        printf "arms=%d capped=%s cov=- arms_pulled=%d\n", n_arms, capped, n_pulled
         exit
       }
-      # Top-arm share
-      max_p = 0
-      for (k in pulls) if (pulls[k] > max_p) max_p = pulls[k]
-      top_pct = (max_p / total_pulls) * 100
-
-      # Gini coefficient over pull_count values (0 = perfectly equal,
-      # ~1 = all pulls on one arm). Standard mean-absolute-difference form.
-      m = 0
-      for (k in pulls) { vals[m] = pulls[k]; m++ }
-      abs_sum = 0
-      for (i = 0; i < m; i++)
-        for (j = 0; j < m; j++) {
-          d = vals[i] - vals[j]
-          if (d < 0) d = -d
-          abs_sum += d
-        }
-      mean_p = total_pulls / n_arms
-      gini = (mean_p > 0) ? (abs_sum / (2 * m * m * mean_p)) : 0
-
-      printf "top_pct=%.1f gini=%.3f arms_pulled=%d/%d max_pulls=%d\n", \
-        top_pct, gini, n_pulled, n_arms, max_p
+      mean = sum / n_pulled
+      ss = 0
+      for (i = 0; i < n_pulled; i++) { d = avgs[i] - mean; ss += d * d }
+      sd = sqrt(ss / n_pulled)
+      cov = (mean != 0) ? (sd / mean) : 0
+      printf "arms=%d capped=%s cov=%.3f arms_pulled=%d\n", n_arms, capped, cov, n_pulled
     }
   ' "$mabstats"
 }
 
 # ---------------------------------------------------------------------------
-# Whether arm 0 (initial seed, state 0) is still the single most-pulled
-# arm — the pattern this fix targets.
+# Eviction count for state 0 — number of duplicate (state_id, arm_idx)
+# rows in mab_seed_map, i.e. how many times an arm slot was reused after
+# an eviction. 0 means the cap never fired (state 0 stayed under 30 seeds
+# the whole run); anything > 0 confirms mab_cap_seeds() is active.
 #
-# Usage: arm0_check MAB_STATS_FILE
-# Prints: "arm0_is_top=<yes|no> arm0_pulls=<n>"
+# Usage: eviction_count MAB_SEED_MAP_FILE
+# Prints: "evictions=<n>"
 # ---------------------------------------------------------------------------
 
-arm0_check() {
-  local mabstats="$1"
-  if [ ! -f "$mabstats" ]; then
-    echo "arm0_is_top=? arm0_pulls=?"
+eviction_count() {
+  local mapfile="$1"
+  if [ ! -f "$mapfile" ]; then
+    echo "evictions=-"
     return
   fi
-
-  awk '
-    BEGIN { in_data = 0 }
-    /^# state_id/ { in_data = 1; next }
-    in_data && NF >= 3 && $1 == 0 {
-      pulls[$2] = $3
-      if ($3 > max_p) { max_p = $3; max_idx = $2 }
-      if ($2 == 0) arm0_pulls = $3
-    }
+  awk -F',' '
+    NR > 1 && $1 == 0 { seen[$2]++ }
     END {
-      is_top = (max_idx == 0 && max_p > 0) ? "yes" : "no"
-      printf "arm0_is_top=%s arm0_pulls=%d\n", is_top, arm0_pulls + 0
+      n = 0
+      for (k in seen) if (seen[k] > 1) n += (seen[k] - 1)
+      printf "evictions=%d\n", n
     }
-  ' "$mabstats"
+  ' "$mapfile"
+}
+
+# ---------------------------------------------------------------------------
+# Reward-log anomaly count — rows with zero, negative, or non-numeric
+# reward anywhere in the log. Coarse proxy for check #6 (no timestamp
+# column in mab_seed_map to correlate with eviction events precisely).
+#
+# Usage: reward_anomaly_count MAB_REWARD_LOG_FILE
+# Prints: "anomalies=<n>"
+# ---------------------------------------------------------------------------
+
+reward_anomaly_count() {
+  local rewardfile="$1"
+  if [ ! -f "$rewardfile" ]; then
+    echo "anomalies=-"
+    return
+  fi
+  tail -n +2 "$rewardfile" | awk -F',' '
+    {
+      r = $6
+      if (r !~ /^-?[0-9]+(\.[0-9]+)?$/ || r + 0 < 0) c++
+    }
+    END { printf "anomalies=%d\n", c + 0 }
+  '
 }
 
 # ---------------------------------------------------------------------------
 # Print a quick per-rep stats line for one extracted rep directory.
-# Reports the zero-reward rate and saturation rate (reward composition,
-# unaffected by this fix — carried over as a sanity check) AND the
-# arm-lock-in stats plus the arm-0-specific check (the thing this pilot
-# specifically validates).
 # Usage: quick_stats REP_DIR REP_INDEX
 # ---------------------------------------------------------------------------
 
@@ -261,6 +287,7 @@ quick_stats() {
   local statsfile="${dir}/fuzzer_stats"
   local mabfile="${dir}/mab_reward_log"
   local mabstats="${dir}/mab_stats"
+  local mapfile="${dir}/mab_seed_map"
 
   if [ ! -f "$statsfile" ]; then
     log "    rep${rep}: fuzzer_stats not found"
@@ -292,13 +319,12 @@ quick_stats() {
     sat_pct="-"
   fi
 
-  local lockin arm0
-  lockin=$(lockin_stats "$mabstats" 2>/dev/null) \
-    || lockin="top_pct=? gini=? arms_pulled=?/? max_pulls=?"
-  arm0=$(arm0_check "$mabstats" 2>/dev/null) \
-    || arm0="arm0_is_top=? arm0_pulls=?"
+  local kcap evict anom
+  kcap=$(kcap_stats "$mabstats" 2>/dev/null) || kcap="arms=? capped=? cov=? arms_pulled=?"
+  evict=$(eviction_count "$mapfile" 2>/dev/null) || evict="evictions=?"
+  anom=$(reward_anomaly_count "$mabfile" 2>/dev/null) || anom="anomalies=?"
 
-  log "    rep${rep}: execs=${execs} paths=${paths} crashes=${crashes} mab_rounds=${mab_rounds} zero_reward=(${zero_pct}%) saturated=(${sat_pct}%) state0[${lockin}] ${arm0}"
+  log "    rep${rep}: execs=${execs} paths=${paths} crashes=${crashes} mab_rounds=${mab_rounds} zero_reward=(${zero_pct}%) saturated=(${sat_pct}%) state0[${kcap}] ${evict} ${anom}"
 }
 
 # ---------------------------------------------------------------------------
@@ -313,7 +339,7 @@ quick_stats() {
 
 run_algo_single() {
   local S="$1" NAME="$2"
-  local OUTDIR="out-1h-mab-s${S}-${NAME}-sb-asleep-fix"
+  local OUTDIR="out-1h-mab-s${S}-${NAME}-kcap"
   local OPTS="${COMMON_OPTS} -s ${S}"
 
   log "--- Starting s${S} (${NAME}) — ${RUNS} reps in parallel ---"
@@ -397,8 +423,8 @@ run_algo_single() {
 }
 
 # ---------------------------------------------------------------------------
-# Run both sleeping-bandit algorithms sequentially (one at a time, 10 reps
-# in parallel within each).
+# Run all algorithms sequentially (one at a time, 10 reps in parallel
+# within each).
 # ---------------------------------------------------------------------------
 
 run_all_algos_sequentially() {
@@ -427,7 +453,7 @@ extract_remaining() {
   for entry in "${MAB_ALGOS[@]}"; do
     local S="${entry%%:*}"
     local NAME="${entry##*:}"
-    local OUTDIR="out-1h-mab-s${S}-${NAME}-sb-asleep-fix"
+    local OUTDIR="out-1h-mab-s${S}-${NAME}-kcap"
 
     for i in $(seq 1 "$RUNS"); do
       local TARBALL="${RESULTS_DIR}/${OUTDIR}_${i}.tar.gz"
@@ -453,7 +479,8 @@ extract_remaining() {
 }
 
 # ---------------------------------------------------------------------------
-# Verify mab_reward_log, mab_stats for all reps of all algorithms
+# Verify mab_reward_log, mab_stats, mab_seed_map for all reps of all
+# algorithms
 # ---------------------------------------------------------------------------
 
 verify_mab_outputs() {
@@ -464,13 +491,13 @@ verify_mab_outputs() {
   for entry in "${MAB_ALGOS[@]}"; do
     local S="${entry%%:*}"
     local NAME="${entry##*:}"
-    local OUTDIR="out-1h-mab-s${S}-${NAME}-sb-asleep-fix"
+    local OUTDIR="out-1h-mab-s${S}-${NAME}-kcap"
 
     for i in $(seq 1 "$RUNS"); do
       local REP_DIR="${RESULTS_DIR}/${OUTDIR}_${i}"
 
       if [ -d "$REP_DIR" ]; then
-        for file in mab_stats mab_reward_log; do
+        for file in mab_stats mab_reward_log mab_seed_map; do
           if [ -f "${REP_DIR}/${file}" ]; then
             found=$((found + 1))
           else
@@ -480,7 +507,7 @@ verify_mab_outputs() {
         done
       else
         warn "  Missing directory: ${REP_DIR}"
-        missing=$((missing + 2))
+        missing=$((missing + 3))
       fi
     done
   done
@@ -495,32 +522,34 @@ verify_mab_outputs() {
 # ---------------------------------------------------------------------------
 
 print_summary() {
-  log "=== Summary (${RUNS} reps per algorithm, sleeping-bandit asleep-predicate fix) ==="
+  log "=== Summary (${RUNS} reps per algorithm, K-cap validation) ==="
   log ""
-  printf "%-6s %-12s %10s %12s %10s %10s %10s %10s %10s %12s\n" \
-    "s" "Algorithm" "execs" "mab_rounds" "zero_pct" "sat_pct" "top_pct" "gini" "max_pulls" "arm0_top_pct"
-  printf "%-6s %-12s %10s %12s %10s %10s %10s %10s %10s %12s\n" \
-    "------" "------------" "--------" "----------" "--------" "--------" "--------" "--------" "--------" "------------"
+  printf "%-6s %-18s %10s %12s %10s %10s %8s %8s %10s %10s\n" \
+    "s" "Algorithm" "execs" "mab_rounds" "zero_pct" "sat_pct" "arms" "cov" "evictions" "anomalies"
+  printf "%-6s %-18s %10s %12s %10s %10s %8s %8s %10s %10s\n" \
+    "------" "------------------" "--------" "----------" "--------" "--------" "--------" "--------" "----------" "----------"
 
   for entry in "${MAB_ALGOS[@]}"; do
     local S="${entry%%:*}"
     local NAME="${entry##*:}"
-    local OUTDIR="out-1h-mab-s${S}-${NAME}-sb-asleep-fix"
+    local OUTDIR="out-1h-mab-s${S}-${NAME}-kcap"
 
-    local -a execs_vals=() zero_pct_vals=() sat_pct_vals=() top_pct_vals=() gini_vals=() max_pulls_vals=() arm0_top_vals=()
-    local rep_count=0 mab_rounds_sum=0
+    local -a execs_vals=() zero_pct_vals=() sat_pct_vals=() arms_vals=() cov_vals=() evict_vals=() anom_vals=()
+    local rep_count=0 mab_rounds_sum=0 crashes_sum=0
 
     for i in $(seq 1 "$RUNS"); do
       local REP_DIR="${RESULTS_DIR}/${OUTDIR}_${i}"
       local statsfile="${REP_DIR}/fuzzer_stats"
       local rewardfile="${REP_DIR}/mab_reward_log"
       local mabstats="${REP_DIR}/mab_stats"
+      local mapfile="${REP_DIR}/mab_seed_map"
 
       [ -f "$statsfile" ] || continue
       rep_count=$((rep_count + 1))
 
-      local e r z s zp sp lockin top_pct gini max_pulls arm0 arm0_is_top arm0_top_val
+      local e r z s zp sp cr kcap arms cov evict evict_n anom anom_n
       e=$(grep "^execs_done" "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
+      cr=$(grep "^unique_crashes" "$statsfile" | awk -F': ' '{print $2}' | tr -d ' ')
       r=$(tail -n +2 "$rewardfile" 2>/dev/null | wc -l)
       z=$(tail -n +2 "$rewardfile" 2>/dev/null | awk -F',' '$6+0==0 {c++} END{print c+0}')
       s=$(tail -n +2 "$rewardfile" 2>/dev/null | awk -F',' '$6+0>=1.0 {c++} END{print c+0}')
@@ -532,62 +561,69 @@ print_summary() {
         sp="0.0"
       fi
 
-      lockin=$(lockin_stats "$mabstats" 2>/dev/null) || lockin=""
-      top_pct=$(echo "$lockin" | grep -oP 'top_pct=\K[0-9.]+' 2>/dev/null || echo "0.0")
-      gini=$(echo "$lockin" | grep -oP 'gini=\K[0-9.]+' 2>/dev/null || echo "0.000")
-      max_pulls=$(echo "$lockin" | grep -oP 'max_pulls=\K[0-9]+' 2>/dev/null || echo "0")
-      [ -z "$top_pct" ] && top_pct="0.0"
-      [ -z "$gini" ] && gini="0.000"
-      [ -z "$max_pulls" ] && max_pulls="0"
+      kcap=$(kcap_stats "$mabstats" 2>/dev/null) || kcap=""
+      arms=$(echo "$kcap" | grep -oP 'arms=\K[0-9]+' 2>/dev/null || echo "0")
+      cov=$(echo "$kcap" | grep -oP 'cov=\K[0-9.]+' 2>/dev/null || echo "0.000")
+      [ -z "$arms" ] && arms="0"
+      [ -z "$cov" ] && cov="0.000"
 
-      arm0=$(arm0_check "$mabstats" 2>/dev/null) || arm0=""
-      arm0_is_top=$(echo "$arm0" | grep -oP 'arm0_is_top=\K[a-z]+' 2>/dev/null || echo "no")
-      arm0_top_val=0
-      [ "$arm0_is_top" = "yes" ] && arm0_top_val=100
+      evict=$(eviction_count "$mapfile" 2>/dev/null) || evict=""
+      evict_n=$(echo "$evict" | grep -oP 'evictions=\K[0-9]+' 2>/dev/null || echo "0")
+      [ -z "$evict_n" ] && evict_n="0"
+
+      anom=$(reward_anomaly_count "$rewardfile" 2>/dev/null) || anom=""
+      anom_n=$(echo "$anom" | grep -oP 'anomalies=\K[0-9]+' 2>/dev/null || echo "0")
+      [ -z "$anom_n" ] && anom_n="0"
 
       execs_vals+=("${e:-0}")
       zero_pct_vals+=("${zp:-0}")
       sat_pct_vals+=("${sp:-0}")
-      top_pct_vals+=("${top_pct:-0}")
-      gini_vals+=("${gini:-0}")
-      max_pulls_vals+=("${max_pulls:-0}")
-      arm0_top_vals+=("${arm0_top_val}")
+      arms_vals+=("${arms}")
+      cov_vals+=("${cov}")
+      evict_vals+=("${evict_n}")
+      anom_vals+=("${anom_n}")
       mab_rounds_sum=$((mab_rounds_sum + ${r:-0}))
+      crashes_sum=$((crashes_sum + ${cr:-0}))
     done
 
     if [ "$rep_count" -eq 0 ]; then
-      printf "%-6s %-12s %10s %12s %10s %10s %10s %10s %10s %12s\n" \
+      printf "%-6s %-18s %10s %12s %10s %10s %8s %8s %10s %10s\n" \
         "s${S}" "$NAME" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A"
       continue
     fi
 
-    local execs_stat zero_pct_stat sat_pct_stat top_pct_stat gini_stat max_pulls_stat mab_rounds_mean arm0_top_stat
+    local execs_stat zero_pct_stat sat_pct_stat arms_stat cov_stat evict_stat anom_stat mab_rounds_mean
     execs_stat=$(printf '%s\n' "${execs_vals[@]}" \
       | awk '{sum+=$1;n++} END{printf "%d", int(sum/n)}')
     zero_pct_stat=$(printf '%s\n' "${zero_pct_vals[@]}" \
       | awk '{sum+=$1;n++} END{printf "%.1f", sum/n}')
     sat_pct_stat=$(printf '%s\n' "${sat_pct_vals[@]}" \
       | awk '{sum+=$1;n++} END{printf "%.1f", sum/n}')
-    top_pct_stat=$(printf '%s\n' "${top_pct_vals[@]}" \
-      | awk '{sum+=$1;n++} END{printf "%.1f", sum/n}')
-    gini_stat=$(printf '%s\n' "${gini_vals[@]}" \
-      | awk '{sum+=$1;n++} END{printf "%.3f", sum/n}')
-    max_pulls_stat=$(printf '%s\n' "${max_pulls_vals[@]}" \
+    arms_stat=$(printf '%s\n' "${arms_vals[@]}" \
       | awk '{sum+=$1;n++} END{printf "%d", int(sum/n)}')
-    arm0_top_stat=$(printf '%s\n' "${arm0_top_vals[@]}" \
-      | awk '{sum+=$1;n++} END{printf "%.0f", sum/n}')
+    cov_stat=$(printf '%s\n' "${cov_vals[@]}" \
+      | awk '{sum+=$1;n++} END{printf "%.3f", sum/n}')
+    evict_stat=$(printf '%s\n' "${evict_vals[@]}" \
+      | awk '{sum+=$1;n++} END{printf "%d", int(sum/n)}')
+    anom_stat=$(printf '%s\n' "${anom_vals[@]}" \
+      | awk '{sum+=$1;n++} END{printf "%d", int(sum/n)}')
     mab_rounds_mean=$((mab_rounds_sum / rep_count))
 
-    printf "%-6s %-12s %10s %12s %10s %10s %10s %10s %10s %11s%%\n" \
-      "s${S}" "$NAME" "$execs_stat" "$mab_rounds_mean" "${zero_pct_stat}%" "${sat_pct_stat}%" "${top_pct_stat}%" "$gini_stat" "$max_pulls_stat" "$arm0_top_stat"
+    printf "%-6s %-18s %10s %12s %10s %10s %8s %8s %10s %10s\n" \
+      "s${S}" "$NAME" "$execs_stat" "$mab_rounds_mean" "${zero_pct_stat}%" "${sat_pct_stat}%" "$arms_stat" "$cov_stat" "$evict_stat" "$anom_stat"
+
+    log "  ${NAME}: total crashes across ${rep_count} reps = ${crashes_sum}"
   done
   log ""
-  log "  zero_pct/sat_pct: mean %% of rounds with reward==0 / reward>=1.0 (sanity check only)"
-  log "  top_pct/gini/max_pulls: state 0's pull-count concentration across arms."
-  log "    SB-EXP3-IX target: drop from 22.6%%/0.856 (pre-fix) toward EXP3-IX's"
-  log "    10.3%%/0.880 baseline (both from 1h-ix-lockin-fix). SLEEPING_BANDIT"
-  log "    should barely move."
-  log "  arm0_top_pct: %% of reps where arm 0 (initial seed) is the top-pulled arm."
+  log "  zero_pct/sat_pct: mean %% of rounds with reward==0 / reward>=1.0 (sanity check only)."
+  log "  arms: mean state-0 arm count (should be <= ${MAX_SEEDS_PER_STATE}; ~${MAX_SEEDS_PER_STATE} means cap is binding)."
+  log "  cov: coefficient of variation of cumul_reward/pull_count in state 0"
+  log "    (arm discriminability — higher means arms are more distinguishable)."
+  log "  evictions: mean count of duplicate arm_idx reuse in state 0's seed map"
+  log "    (0 means the cap never fired for that algorithm/rep)."
+  log "  anomalies: mean count of zero/negative/non-numeric reward rows"
+  log "    (coarse proxy only — not time-correlated with evictions)."
+  log "  mab_rounds: expect ~52 rounds/state/hour if K-cap overhead is negligible."
   log "=== Summary done ==="
   echo ""
 }
@@ -598,16 +634,17 @@ print_summary() {
 
 main() {
   log "======================================================================"
-  log "1h Pilot: SLEEPING_BANDIT + SLEEPING_BANDIT_IX — Asleep-Predicate Fix"
+  log "1h Pilot: EXP3/EXP3-IX/SLEEPING_BANDIT/SLEEPING_BANDIT_IX/UCB1/THOMPSON — K-cap"
   log "======================================================================"
   log "Algorithms (sequential): ${MAB_ALGOS[*]}"
   log "Reps per algorithm (parallel): $RUNS"
-  log "Testing: mab_seed_asleep() — initial seeds could never sleep under the"
-  log "old predicate (favored bit only ever goes 0->1), so arm 0 kept a"
-  log "shrinking-denominator advantage as other arms correctly fell asleep."
-  log "Expected: SB-EXP3-IX's top_pct/gini/arm0_top_pct should drop toward the"
-  log "non-sleeping EXP3-IX baseline (10.3%%, from 1h-ix-lockin-fix) from its"
-  log "pre-fix value (22.6%%). SLEEPING_BANDIT (non-IX) should change little."
+  log "Testing: mab_cap_seeds() — caps each state's seed/arm pool at"
+  log "MAX_SEEDS_PER_STATE (${MAX_SEEDS_PER_STATE}), evicting the lowest-"
+  log "performing arm (never the one in flight this round)."
+  log "Checks: no crashes; state 0 arm count caps at ${MAX_SEEDS_PER_STATE};"
+  log "evictions occur (duplicate arm_idx in mab_seed_map); round rate"
+  log "roughly unaffected; arm discriminability (cov) reasonable; no obvious"
+  log "reward-log anomalies."
   log "======================================================================"
   echo ""
 
@@ -619,7 +656,7 @@ main() {
   print_summary
 
   log "======================================================================"
-  log "1h Sleeping-Bandit Asleep-Predicate Fix Pilot COMPLETE"
+  log "1h K-cap Pilot COMPLETE"
   log "======================================================================"
   log "Results: $RESULTS_DIR"
   log "Log file: $LOG_FILE"
