@@ -573,7 +573,7 @@ if [ -n "$ALGOS_CSV" ]; then
   for _tok in "${_algos_tokens[@]}"; do
     _tok="$(echo "$_tok" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [ -z "$_tok" ] && continue
-    _t="$(echo "$_tok" | tr '[:lower:]' '[:upper:]' | tr -d '-_')"
+    _t="$(echo "$_tok" | tr '[:lower:]' '[:upper:]' | tr -d '_-')"
     if [ "$_t" = "ALL" ]; then
       for _e in "${ALL_ALGOS[@]}"; do WANTED["${_e%%:*}"]=1; done
     elif [ "$_t" = "RERUN" ]; then
@@ -584,7 +584,7 @@ if [ -n "$ALGOS_CSV" ]; then
       _matched=0
       for _e in "${ALL_ALGOS[@]}"; do
         _s="${_e%%:*}"; _name="${_e##*:}"
-        _nn="$(echo "$_name" | tr '[:lower:]' '[:upper:]' | tr -d '-_')"
+        _nn="$(echo "$_name" | tr '[:lower:]' '[:upper:]' | tr -d '_-')"
         if [ "$_nn" = "$_t" ]; then WANTED[$_s]=1; _matched=1; break; fi
       done
       if [ "$_matched" -eq 0 ]; then
