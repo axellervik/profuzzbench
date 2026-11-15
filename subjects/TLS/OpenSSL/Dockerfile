@@ -6,7 +6,7 @@ ENV WORKDIR="/home/ubuntu/experiments"
 ARG MAKE_OPT
 
 # Build mabflnet (our fuzzer fork -- this layer is the only one that changes between iterations)
-RUN git clone --branch mab https://github.com/axellervik/mabflnet.git mabflnet && \
+RUN git clone --branch master https://github.com/axellervik/mabflnet.git mabflnet && \
     cd mabflnet && \
     make clean all $MAKE_OPT && \
     cd llvm_mode && make $MAKE_OPT
