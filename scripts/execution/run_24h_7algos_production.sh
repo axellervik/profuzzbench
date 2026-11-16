@@ -1059,12 +1059,14 @@ run_coverage_for_algo() {
     rc_valid=0
     invalid_reason=$(is_valid_csv "$extracted_dir/cov_fixed.csv" "$tb") || rc_valid=$?
     if [ $rc_valid -ne 0 ]; then
-      warn "  ERROR: cov_fixed.csv for $base is invalid: $invalid_reason"
-      rm -rf "$work"
-      continue
+      warn "  WARNING: cov_fixed.csv for $base is invalid ($invalid_reason) — writing _v2.csv anyway so no run loses its coverage file"
     fi
     cp "$extracted_dir/cov_fixed.csv" "$out_csv"
-    log "  [done] $base -> $out_csv ($(wc -l < "$out_csv") lines)"
+    if [ $rc_valid -eq 0 ]; then
+      log "  [done] $base -> $out_csv ($(wc -l < "$out_csv") lines)"
+    else
+      warn "  [done-INVALID] $base -> $out_csv ($(wc -l < "$out_csv") lines)"
+    fi
     rm -rf "$work"
   done
   log "  Coverage regen for s${S} (${NAME}) done."
