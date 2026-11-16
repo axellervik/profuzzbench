@@ -106,9 +106,9 @@
 #     bash run_24h_7algos_production.sh --smoke-test
 #
 #   Defaults under --smoke-test (each individually overridable — see
-#   --help): RUNS=2, TIMEOUT=120s, POLL_INTERVAL=20s,
+#   --help): RUNS=2, TIMEOUT=600s, POLL_INTERVAL=20s,
 #   EARLY_FAILURE_WINDOW=40s, CONTAINER_START_WAIT=5s, and only the
-#   first 2 entries of ALL_ALGOS are run (override with --smoke-algos).
+#   first 1 entry of ALL_ALGOS (EXP3) is run (override with --smoke-algos).
 #
 #   Smoke-test runs are written under a distinctly-suffixed results
 #   directory (...-SMOKETEST, ...-SMOKETEST-2, ...) and use a separate
@@ -126,6 +126,7 @@ set -euo pipefail
 RUNS=10                               # repetitions per algorithm (parallel)
 TIMEOUT=86400                         # 24 hours per run
 SKIPCOUNT=5                           # gcovr every 5 seeds
+STEP=5                                # cov_script step size (non-negotiable for plotting); used by is_valid_csv
 IMAGE="openssl-mabflnet-kcap"
 COMMON_OPTS="-P TLS -D 10000 -q 3 -E -K -R -W 100"
 MIN_DISK_MB=5120                      # refuse to start a new algo if < 5 GB free
@@ -146,262 +147,6 @@ ALL_ALGOS=(
 
 MAX_SEEDS_PER_STATE=30                # must match config.h
 COV_FROZEN_RATIO=1.5                  # l_abs last/first below this = frozen (verify_coverage_outputs)
-COV_SCRIPT_TMP=""                     # temp dir for the embedded coverage script (set in run_coverage_phase)
-
-# ---------------------------------------------------------------------------
-# Embedded per-container coverage measurement script (was
-# coverage_regen/robust_cov_script.sh). Written to a temp dir at runtime and
-# bind-mounted into each coverage container. Quoted heredoc (<<'ROBUST_COV_EOF')
-# so nothing expands at embed time and `set -m` (the job-control fix) is
-# preserved in position.
-# ---------------------------------------------------------------------------
-read -r -d '' EMBEDDED_ROBUST_COV <<'ROBUST_COV_EOF' || true
-#!/bin/bash
-# robust_cov_script.sh
-#
-# Drop-in replacement for profuzzbench's subjects/TLS/OpenSSL/cov_script.sh.
-#
-# WHY THIS EXISTS:
-# The stock cov_script.sh silently redirects both the replayer's and the
-# s_server's stdout/stderr to /dev/null ("> /dev/null 2>&1"). If a single
-# iteration fails (e.g. s_server can't rebind port 4433 because the
-# previous instance hasn't released it yet, or aflnet-replay can't connect
-# in time), NOTHING in the original script detects or reports this. Because
-# gcov counters (.gcda files) are cumulative across process invocations,
-# a single silent failure part-way through a long replay (800+ queue files)
-# causes ALL subsequent gcovr coverage samples to freeze at whatever value
-# was reached right before the failure -- while the loop keeps running
-# and backfilling plausible-looking (but stale) Time values for every
-# remaining row. This produces exactly the "steep climb then dead flat"
-# cov_over_time.csv pattern observed in the 24h-9algos-10runs-production
-# results, even though AFL's own live fuzzer_stats shows real, continued
-# coverage growth (bitmap_cvg, paths_total) throughout the full 24h run.
-#
-# This script:
-#   1. Verifies the target port is free before each s_server launch
-#      (waits/retries instead of racing into a bind failure).
-#   2. Captures the replayer's exit code and stderr per file instead of
-#      discarding them.
-#   3. Retries a failed replay once after a short cooldown -- if the
-#      retry also fails, the file/iteration is logged as a genuine
-#      replay failure (recorded in the debug log AND flagged inline in
-#      the CSV via an extra "replay_ok" column) rather than silently
-#      corrupting all later rows.
-#   4. Emits the exact same 5-column CSV header the original script used
-#      (Time,l_per,l_abs,b_per,b_abs) PLUS a 6th column "replay_ok" so
-#      existing/older plotting scripts that only read the first 5 columns
-#      keep working unmodified, while new tooling can see exactly which
-#      rows are trustworthy.
-#
-# USAGE (identical positional args to the original cov_script.sh):
-#   ./robust_cov_script.sh <folder> <port> <skipcount> <covfile> <fmode> [debuglog]
-#
-#   folder    fuzzer result folder (contains queue/ or replayable-queue/)
-#   port      server's network port (e.g. 4433)
-#   skipcount run gcovr after every N test cases
-#   covfile   path to output coverage CSV
-#   fmode     0 = concatenated (afl-replay/queue), 1 = structured (aflnet-replay/replayable-queue)
-#   debuglog  optional path for detailed per-file replay log (default: <covfile>.debug.log)
-#
-# Must be run from the openssl-gcov build directory (same requirement as
-# the original script), with aflnet-replay/afl-replay and openssl s_server
-# on PATH / available relative to cwd, exactly as the original run.sh does.
-#
-# CRITICAL FIX (confirmed via controlled A/B test, fresh containers,
-# 2026-08-26): bash disables job control (monitor mode) by default when a
-# script is executed as a file, even from an interactive parent shell. This
-# script backgrounds the replayer ($replayer ... &) and runs the server in
-# the foreground. Without job control, the backgrounded replayer's process
-# group / signal handling breaks down in a way that silently prevents the
-# TLS handshake from completing -- gcov's .gcda counters then never advance,
-# producing a permanent 0 (or frozen-at-whatever-value) coverage reading,
-# even though the exact same commands typed one-by-one at an interactive
-# prompt work perfectly. `set -m` forces job control on regardless of how
-# the script is invoked, which fixes this. Confirmed with a clean fresh-
-# container A/B: identical 8-file replay subset, identical everything else,
-# WITHOUT set -m => flat 0,0,0,0,0,0 for all 6 sampled rows; WITH set -m =>
-# real climbing coverage (18985 -> 19589 lines) across the same 6 rows.
-# This is unrelated to Docker's -i/-t flags, CRLF line endings, or which
-# aflnet-replay binary is used -- all of those were ruled out first.
-set -m
-set -u
-
-folder=$1
-pno=$2
-step=$3
-covfile=$4
-fmode=$5
-debuglog=${6:-"${covfile}.debug.log"}
-
-PORT_WAIT_TIMEOUT_S=5     # max seconds to wait for the port to become free
-PORT_POLL_INTERVAL_S=0.2
-REPLAY_RETRY_COOLDOWN_S=1
-SERVER_TIMEOUT_S=3        # matches original script's "timeout -k 0 3s"
-
-rm -f "$covfile"; touch "$covfile"
-: > "$debuglog"
-
-# CRITICAL: Explicitly delete .gcda files before resetting gcov counters.
-# `gcovr -r . -s -d` only tells gcov to reinitialize, but doesn't actually
-# delete stale .gcda data from prior runs -- old coverage can linger and
-# prevent new coverage from accumulating. This is especially important here
-# since we might be replaying against a different binary environment than
-# the original fuzzing run used.
-# NOTE: DO NOT delete .gcno files -- those are the instrumentation metadata
-# that gcovr needs to measure coverage. Deleting them breaks instrumentation.
-find . -name "*.gcda" -type f -delete 2>/dev/null || true
-gcovr -r . -s -d > /dev/null 2>&1
-
-echo "Time,l_per,l_abs,b_per,b_abs,replay_ok" >> "$covfile"
-
-if [ "$fmode" -eq "1" ]; then
-  testdir="replayable-queue"
-  # CRITICAL: Use explicit path to mabflnet's replayer, not bare "aflnet-replay".
-  # The container has BOTH /home/ubuntu/aflnet/aflnet-replay (original, wrong)
-  # and /home/ubuntu/mabflnet/aflnet-replay (correct, K-cap-aware). If we use
-  # the bare name, whichever appears first in PATH wins -- and that's aflnet,
-  # not mabflnet. Using the wrong replayer causes it to either fail to parse
-  # mabflnet-generated queue files correctly or exercise different code paths
-  # than intended, resulting in .gcda coverage that never advances.
-  replayer="/home/ubuntu/mabflnet/aflnet-replay"
-else
-  testdir="queue"
-  replayer="/home/ubuntu/mabflnet/afl-replay"
-fi
-
-log() {
-  echo "[$(date '+%H:%M:%S')] $*" >> "$debuglog"
-}
-
-port_is_free() {
-  # Returns 0 (true) if nothing is listening on $pno right now.
-  # Prefer `ss` (iproute2, present on modern Ubuntu); fall back to netstat.
-  if command -v ss > /dev/null 2>&1; then
-    ! ss -ltn "sport = :$pno" 2>/dev/null | grep -q ":$pno"
-  elif command -v netstat > /dev/null 2>&1; then
-    ! netstat -ltn 2>/dev/null | grep -q ":$pno "
-  else
-    return 0  # can't check; assume free rather than deadlock
-  fi
-}
-
-wait_for_port_free() {
-  # Pure-integer implementation (no `bc` dependency -- some minimal
-  # container images don't have bc installed, and the old bc-based
-  # version silently never timed out in that case, risking a hang).
-  local max_iters
-  max_iters=$(awk -v t="$PORT_WAIT_TIMEOUT_S" -v p="$PORT_POLL_INTERVAL_S" 'BEGIN{printf "%d", (t/p)+0.9999}' 2>/dev/null)
-  [ -z "$max_iters" ] && max_iters=25   # fallback: ~5s at 0.2s/iter
-  local i=0
-  while ! port_is_free; do
-    i=$((i+1))
-    if [ "$i" -ge "$max_iters" ]; then
-      log "WARNING: port $pno still not free after ~${PORT_WAIT_TIMEOUT_S}s wait, proceeding anyway"
-      return 1
-    fi
-    sleep "$PORT_POLL_INTERVAL_S"
-  done
-  return 0
-}
-
-# Run one replay attempt against one queue file.
-# Sets global REPLAY_EXIT to the replayer's exit code.
-run_one_replay() {
-  local f="$1"
-  wait_for_port_free
-  "$replayer" "$f" TLS "$pno" 100 > "${debuglog}.replayer_stdout" 2> "${debuglog}.replayer_stderr" &
-  local replay_pid=$!
-  sleep 1  # Give the replayer time to connect before s_server starts listening
-  timeout -k 0 "${SERVER_TIMEOUT_S}s" ./apps/openssl s_server -key key.pem -cert cert.pem -4 -naccept 1 -no_anti_replay \
-    > "${debuglog}.server_stdout" 2> "${debuglog}.server_stderr"
-  local server_status=$?
-  wait "$replay_pid"
-  REPLAY_EXIT=$?
-  # NOTE: with -naccept 1, s_server exits with status 0 on its own once
-  # it has handled one connection. Any nonzero server_status means
-  # either (a) `timeout` killed it after SERVER_TIMEOUT_S because it
-  # never received a connection (exit 124 -- the exact "replay couldn't
-  # connect / port still bound by a stale process" scenario this script
-  # exists to detect), or (b) s_server crashed/errored on its own (some
-  # other nonzero code). Both are genuine failures -- do NOT special-case
-  # 124 as "ok", that would defeat the whole point of this check.
-  if [ "$REPLAY_EXIT" != "0" ] || [ "$server_status" != "0" ]; then
-    log "REPLAY FAILURE on '$f' (replayer_exit=$REPLAY_EXIT server_exit=$server_status)"
-    log "  replayer_stderr: $(cat "${debuglog}.replayer_stderr" 2>/dev/null | tr '\n' ' ')"
-    log "  server_stderr:   $(cat "${debuglog}.server_stderr" 2>/dev/null | tr '\n' ' ')"
-    return 1
-  fi
-  return 0
-}
-
-replay_with_retry() {
-  local f="$1"
-  if run_one_replay "$f"; then
-    echo 1
-    return
-  fi
-  log "Retrying '$f' once after ${REPLAY_RETRY_COOLDOWN_S}s cooldown..."
-  sleep "$REPLAY_RETRY_COOLDOWN_S"
-  if run_one_replay "$f"; then
-    log "Retry succeeded for '$f'"
-    echo 1
-    return
-  fi
-  log "Retry FAILED for '$f' -- this row's coverage snapshot is UNRELIABLE"
-  echo 0
-}
-
-sample_coverage() {
-  local time="$1" ok="$2"
-  local cov_data l_per l_abs b_per b_abs
-  cov_data=$(gcovr -r . -s | grep "[lb][a-z]*:")
-  l_per=$(echo "$cov_data" | grep lines | cut -d" " -f2 | rev | cut -c2- | rev)
-  l_abs=$(echo "$cov_data" | grep lines | cut -d" " -f3 | cut -c2-)
-  b_per=$(echo "$cov_data" | grep branch | cut -d" " -f2 | rev | cut -c2- | rev)
-  b_abs=$(echo "$cov_data" | grep branch | cut -d" " -f3 | cut -c2-)
-  echo "$time,$l_per,$l_abs,$b_per,$b_abs,$ok" >> "$covfile"
-}
-
-log "=== robust_cov_script starting: folder=$folder port=$pno step=$step fmode=$fmode ==="
-n_fail=0
-n_total=0
-
-# Process seeds first
-for f in $(echo "$folder/$testdir"/*.raw); do
-  [ -e "$f" ] || continue
-  time=$(stat -c %Y "$f")
-  ok=$(replay_with_retry "$f")
-  n_total=$((n_total+1))
-  [ "$ok" = "0" ] && n_fail=$((n_fail+1))
-  sample_coverage "$time" "$ok"
-done
-
-# Process other testcases
-count=0
-last_f=""
-for f in $(echo "$folder/$testdir"/id*); do
-  [ -e "$f" ] || continue
-  last_f="$f"
-  time=$(stat -c %Y "$f")
-  ok=$(replay_with_retry "$f")
-  n_total=$((n_total+1))
-  [ "$ok" = "0" ] && n_fail=$((n_fail+1))
-
-  count=$((count+1))
-  rem=$((count % step))
-  if [ "$rem" != "0" ]; then continue; fi
-  sample_coverage "$time" "$ok"
-done
-
-# Output cov data for the last testcase(s) if step > 1
-if [ "$step" -gt 1 ] && [ -n "$last_f" ]; then
-  time=$(stat -c %Y "$last_f")
-  sample_coverage "$time" "1"
-fi
-
-log "=== robust_cov_script finished: $n_total files replayed, $n_fail failed (even after retry) ==="
-echo "robust_cov_script: $n_total files replayed, $n_fail failed (even after retry). See $debuglog for details." >&2
-ROBUST_COV_EOF
 
 # ---------------------------------------------------------------------------
 # CLI argument parsing — --smoke-test and individual overrides.
@@ -415,7 +160,7 @@ ROBUST_COV_EOF
 
 SMOKE_TEST=0
 PILOT=0
-SMOKE_ALGOS_COUNT=2   # how many entries of ALL_ALGOS to run under --smoke-test
+SMOKE_ALGOS_COUNT=1   # how many entries of ALL_ALGOS to run under --smoke-test (1 = first algo = EXP3)
 
 print_help() {
   cat <<EOF
@@ -459,12 +204,12 @@ Options:
   -h, --help                 Show this help and exit.
 
 Examples:
-  # Full end-to-end smoke test (2 algos x 2 reps x 2 min, fast poll/
+  # Full end-to-end smoke test (1 algo x 2 reps x 10 min, fast poll/
   # restart windows) — recommended before the real production launch:
   bash $0 --smoke-test
 
   # Smoke test all 7 algorithms (still fast per-algorithm) instead of
-  # just the first 2:
+  # just the first 1:
   bash $0 --smoke-test --smoke-algos 7
 
   # Fast 1h-per-algorithm validation of the 5 re-run algorithms (~5h):
@@ -614,7 +359,7 @@ if [ "$SMOKE_TEST" -eq 1 ]; then
   # when the condition is false would trip `set -e` and abort the whole
   # script.)
   if [ "$RUNS_EXPLICIT" -eq 0 ]; then RUNS=2; fi
-  if [ "$TIMEOUT_EXPLICIT" -eq 0 ]; then TIMEOUT=120; fi
+  if [ "$TIMEOUT_EXPLICIT" -eq 0 ]; then TIMEOUT=600; fi
   if [ "$POLL_INTERVAL_EXPLICIT" -eq 0 ]; then POLL_INTERVAL=20; fi
   if [ "$EARLY_FAILURE_WINDOW_EXPLICIT" -eq 0 ]; then EARLY_FAILURE_WINDOW=40; fi
   if [ "$CONTAINER_START_WAIT_EXPLICIT" -eq 0 ]; then CONTAINER_START_WAIT=5; fi
@@ -762,7 +507,7 @@ cleanup_containers() {
   fi
 }
 
-trap 'log "Caught signal — cleaning up..."; cleanup_containers; rm -rf "${COV_SCRIPT_TMP:-}" 2>/dev/null || true; exit 1' \
+trap 'log "Caught signal — cleaning up..."; cleanup_containers; exit 1' \
   INT TERM HUP
 
 # ---------------------------------------------------------------------------
@@ -1270,17 +1015,16 @@ verify_mab_outputs() {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 2 — sequential coverage generation (self-contained).
+# Phase 2 — sequential coverage generation (one container at a time).
 #
 # Regenerates cov_over_time_v2.csv for every rep, ONE container at a time
 # (sequential is the fix for the coverage-freeze bug — never parallel).
-# Idempotent: skips reps that already have a _v2.csv, so a reboot mid-phase
-# resumes cleanly. The per-container measurement script is embedded above
-# (EMBEDDED_ROBUST_COV) and written to a temp dir to bind-mount.
+# Idempotent: skips reps whose _v2.csv already exists and is valid
+# (is_valid_csv), so a reboot mid-phase resumes cleanly. Each rep runs the
+# stock cov_script inside the container with -it (a real pty is required).
 # ---------------------------------------------------------------------------
 
-run_coverage_orchestrator() {
-  local cov_script_tmp="$1"
+run_coverage_regen_sequential() {
   local scratch_root="${RESULTS_DIR}/_coverage_regen_scratch"
   mkdir -p "$scratch_root"
   shopt -s nullglob
@@ -1290,14 +1034,19 @@ run_coverage_orchestrator() {
     return 0
   fi
   log "  Found ${#tarballs[@]} archives to process."
-  local tb base out_csv_v2 out_log_v2 work extracted_dir container_name n_files n_fail_line
+  local tb base out_csv work extracted_dir rc rc_valid invalid_reason
   for tb in "${tarballs[@]}"; do
     base=$(basename "$tb" .tar.gz)
-    out_csv_v2="${RESULTS_DIR}/${base}.cov_over_time_v2.csv"
-    out_log_v2="${RESULTS_DIR}/${base}.cov_over_time_v2.debug.log"
-    if [ -f "$out_csv_v2" ]; then
-      log "  [skip] $base — already has $out_csv_v2"
+    out_csv="${RESULTS_DIR}/${base}.cov_over_time_v2.csv"
+    # Skip if a valid output already exists (idempotent resume).
+    rc_valid=0
+    invalid_reason=$(is_valid_csv "$out_csv" "$tb") || rc_valid=$?
+    if [ $rc_valid -eq 0 ]; then
+      log "  [skip] $base — valid $out_csv already exists"
       continue
+    elif [ -f "$out_csv" ]; then
+      log "  [redo] $base — existing CSV is bad: $invalid_reason"
+      mv "$out_csv" "${out_csv}.bad.$(date +%s)"
     fi
     log "  [process] $base"
     work="$scratch_root/$base"
@@ -1307,7 +1056,8 @@ run_coverage_orchestrator() {
       warn "  ERROR: corrupt/unreadable tarball $tb, skipping"
       continue
     fi
-    extracted_dir=$(find "$work" -maxdepth 1 -mindepth 1 -type d | head -n1)
+    chmod -R u+rwX,go+rX "$work"
+    extracted_dir=$(find "$work" -mindepth 1 -maxdepth 1 -type d | head -n1)
     if [ -z "$extracted_dir" ]; then
       warn "  ERROR: could not find extracted OUTDIR inside $tb, skipping"
       continue
@@ -1316,30 +1066,27 @@ run_coverage_orchestrator() {
       warn "  ERROR: $extracted_dir has no replayable-queue/, skipping"
       continue
     fi
-    chmod -R a+rwX "$extracted_dir"
-    n_files=$(find "$extracted_dir/replayable-queue" -type f | wc -l)
-    log "    replayable-queue has $n_files files"
-    container_name="covregen_${base}_$$"
-    docker run --rm --name "$container_name" \
-      -v "$extracted_dir:/mnt/outdir" \
-      -v "$cov_script_tmp:/mnt/scripts" \
-      "$IMAGE" /bin/bash -c "
-        set -e
-        cd /home/ubuntu/experiments/openssl-gcov
-        chmod +x /mnt/scripts/robust_cov_script.sh
-        /mnt/scripts/robust_cov_script.sh /mnt/outdir 4433 5 /mnt/outdir/cov_over_time_v2.csv 1 /mnt/outdir/cov_over_time_v2.debug.log
-      " || warn "  WARNING: container exited non-zero for $base (see debug log if produced)"
-    if [ -f "$extracted_dir/cov_over_time_v2.csv" ]; then
-      cp "$extracted_dir/cov_over_time_v2.csv" "$out_csv_v2"
-      log "    -> wrote $out_csv_v2"
-    else
-      warn "  ERROR: no cov_over_time_v2.csv produced for $base"
+    # Proven approach: stock cov_script + -it, one container at a time.
+    rc=0
+    docker run --rm -it -v "$extracted_dir:/mnt/outdir" "$IMAGE" /bin/bash -c "
+      cd /home/ubuntu/experiments/openssl-gcov
+      sed -i 's/\r\$//' /home/ubuntu/experiments/cov_script
+      /home/ubuntu/experiments/cov_script /mnt/outdir 4433 ${STEP} /mnt/outdir/cov_fixed.csv 1
+    " || rc=$?
+    if [ $rc -ne 0 ]; then
+      warn "  ERROR: docker exited with code $rc for $base"
+      rm -rf "$work"
+      continue
     fi
-    if [ -f "$extracted_dir/cov_over_time_v2.debug.log" ]; then
-      cp "$extracted_dir/cov_over_time_v2.debug.log" "$out_log_v2"
-      n_fail_line=$(grep -c "REPLAY FAILURE" "$out_log_v2" || true)
-      log "    -> wrote $out_log_v2 ($n_fail_line individual replay failures logged, retried automatically)"
+    rc_valid=0
+    invalid_reason=$(is_valid_csv "$extracted_dir/cov_fixed.csv" "$tb") || rc_valid=$?
+    if [ $rc_valid -ne 0 ]; then
+      warn "  ERROR: cov_fixed.csv for $base is invalid: $invalid_reason"
+      rm -rf "$work"
+      continue
     fi
+    cp "$extracted_dir/cov_fixed.csv" "$out_csv"
+    log "  [done] $base -> $out_csv ($(wc -l < "$out_csv") lines)"
     rm -rf "$work"
   done
   log "  Coverage regeneration loop done."
@@ -1370,9 +1117,71 @@ verify_coverage_outputs() {
   return 0
 }
 
+# Returns 0 (valid/complete) or 1 (invalid: missing, empty, truncated, or
+# frozen) via exit code. Prints a one-line reason to stdout when invalid.
+# $1 = csv path, $2 = tarball path (to compute expected row count).
+is_valid_csv() {
+  local csv="$1" tarball="$2"
+  local row_count expected_rows seed_count other_count
+
+  [ -f "$csv" ] || { echo "does not exist"; return 1; }
+  [ -s "$csv" ] || { echo "is empty (0 bytes)"; return 1; }
+
+  # Data rows = total lines minus the 1 header line.
+  row_count=$(($(wc -l < "$csv") - 1))
+  if [ "$row_count" -lt 3 ]; then
+    echo "has only ${row_count} data row(s) -- header-only or near-empty"
+    return 1
+  fi
+
+  # Last row must have non-empty l_per/b_per fields (guards against a line
+  # that was cut off mid-write when a container/VM was killed).
+  local last_line last_l_per last_b_per
+  last_line=$(tail -n 1 "$csv" | tr -d '\r')
+  last_l_per=$(echo "$last_line" | awk -F',' '{print $2}')
+  last_b_per=$(echo "$last_line" | awk -F',' '{print $4}')
+  if [ -z "$last_l_per" ] || [ -z "$last_b_per" ]; then
+    echo "last row is malformed/truncated: '${last_line}'"
+    return 1
+  fi
+
+  # Frozen-artifact detection: if the l_per/b_per value at data-row #5 is
+  # STILL identical at the last row (and we have plenty of rows in between),
+  # that's the known 6.3%/4.1%-forever measurement artifact, not real data.
+  if [ "$row_count" -ge 10 ]; then
+    local row5_line row5_l_per row5_b_per
+    row5_line=$(sed -n '6p' "$csv" | tr -d '\r')   # line 1 = header, line 6 = data row 5
+    row5_l_per=$(echo "$row5_line" | awk -F',' '{print $2}')
+    row5_b_per=$(echo "$row5_line" | awk -F',' '{print $4}')
+    if [ "$row5_l_per" == "$last_l_per" ] && [ "$row5_b_per" == "$last_b_per" ]; then
+      echo "coverage frozen at ${last_l_per}%/${last_b_per}% from row 5 through row ${row_count} (measurement artifact)"
+      return 1
+    fi
+  fi
+
+  # Completeness check: compare actual row count to what we'd expect from
+  # the queue size in the tarball (seeds recorded every replay + other
+  # testcases recorded every STEP replays). Catches runs killed partway
+  # through (real, varying data, but truncated).
+  if [ -f "$tarball" ]; then
+    seed_count=$(tar -tzf "$tarball" 2>/dev/null | grep '/replayable-queue/.*\.raw$' | wc -l)
+    other_count=$(tar -tzf "$tarball" 2>/dev/null | grep '/replayable-queue/id' | wc -l)
+    expected_rows=$(( seed_count + (other_count + STEP - 1) / STEP ))
+    if [ "$expected_rows" -gt 0 ]; then
+      # Require at least 85% of expected rows to call it complete.
+      local min_rows=$(( expected_rows * 85 / 100 ))
+      if [ "$row_count" -lt "$min_rows" ]; then
+        echo "looks truncated: ${row_count} rows vs expected ~${expected_rows} (queue has ${seed_count} seeds + ${other_count} testcases)"
+        return 1
+      fi
+    fi
+  fi
+
+  return 0
+}
+
 run_coverage_phase() {
   log "=== Phase 2: sequential coverage generation (one container at a time) ==="
-  if [ "$SMOKE_TEST" -eq 1 ]; then log "  Phase 2 skipped (smoke test)."; return 0; fi
   local completed_n
   completed_n=$(jq '.completed_algos | length' "$STATE_FILE" 2>/dev/null || echo 0)
   if [ "$completed_n" -lt "${#ALL_ALGOS[@]}" ]; then
@@ -1385,12 +1194,8 @@ run_coverage_phase() {
     return 0
   fi
   check_disk "coverage phase"
-  COV_SCRIPT_TMP=$(mktemp -d)
-  printf '%s\n' "$EMBEDDED_ROBUST_COV" > "$COV_SCRIPT_TMP/robust_cov_script.sh"
-  chmod +x "$COV_SCRIPT_TMP/robust_cov_script.sh"
   log "  Running sequential coverage regeneration (one container at a time)..."
-  run_coverage_orchestrator "$COV_SCRIPT_TMP"
-  rm -rf "$COV_SCRIPT_TMP"
+  run_coverage_regen_sequential
   local cov_ok=1
   verify_coverage_outputs || cov_ok=0
   if [ "$cov_ok" -eq 0 ]; then
@@ -1524,24 +1329,20 @@ print_summary() {
   log "  Reps present may be < ${RUNS} if a rep crashed after the"
   log "  ${EARLY_FAILURE_WINDOW}s auto-restart window and was not retried"
   log "  (see script header for rationale)."
-  if [ "$SMOKE_TEST" -eq 1 ]; then
-    log "  Coverage (Phase 2): skipped (smoke test)."
+  local cov_expected=0 cov_found=0 _tb _base
+  shopt -s nullglob
+  for _tb in "$RESULTS_DIR"/*.tar.gz; do
+    cov_expected=$((cov_expected+1))
+    _base=$(basename "$_tb" .tar.gz)
+    [ -f "$RESULTS_DIR/${_base}.cov_over_time_v2.csv" ] && cov_found=$((cov_found+1))
+  done
+  shopt -u nullglob
+  local _cov_state
+  _cov_state=$(jq -r '.coverage // "pending"' "$STATE_FILE" 2>/dev/null || echo "pending")
+  if [ "$cov_expected" -gt 0 ] && [ "$cov_found" -eq "$cov_expected" ] && [ "$_cov_state" = "done" ]; then
+    log "  Coverage (Phase 2): OK — ${cov_found}/${cov_expected} _v2.csv present, all verified."
   else
-    local cov_expected=0 cov_found=0 _tb _base
-    shopt -s nullglob
-    for _tb in "$RESULTS_DIR"/*.tar.gz; do
-      cov_expected=$((cov_expected+1))
-      _base=$(basename "$_tb" .tar.gz)
-      [ -f "$RESULTS_DIR/${_base}.cov_over_time_v2.csv" ] && cov_found=$((cov_found+1))
-    done
-    shopt -u nullglob
-    local _cov_state
-    _cov_state=$(jq -r '.coverage // "pending"' "$STATE_FILE" 2>/dev/null || echo "pending")
-    if [ "$cov_expected" -gt 0 ] && [ "$cov_found" -eq "$cov_expected" ] && [ "$_cov_state" = "done" ]; then
-      log "  Coverage (Phase 2): OK — ${cov_found}/${cov_expected} _v2.csv present, all verified."
-    else
-      log "  Coverage (Phase 2): ${cov_found}/${cov_expected} _v2.csv present (state: ${_cov_state})."
-    fi
+    log "  Coverage (Phase 2): ${cov_found}/${cov_expected} _v2.csv present (state: ${_cov_state})."
   fi
   log "=== Summary done ==="
   echo ""
