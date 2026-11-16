@@ -10,11 +10,14 @@
 #   2. s5 EXP3-IX              — core MAB
 #   3. s6 UCB1                 — opportunistic MAB
 #   4. s7 THOMPSON_SAMPLING    — opportunistic MAB
-#   5. s1 RANDOM               — non-MAB baseline
+#   5. s3 FAVOR                — MAB
 #   6. s2 ROUND-ROBIN          — non-MAB baseline
-#   7. s3 FAVOR                — non-MAB baseline (least important; last
-#                                 on purpose so fresh data is waiting when
-#                                 the user returns from a multi-day trip)
+#   7. s1 RANDOM               — non-MAB baseline
+#
+# Each algorithm runs its fuzz (10 reps in parallel) and then its own coverage
+# regeneration (one container at a time) before the next algorithm starts, so
+# every finished algorithm already has its cov_over_time_v2.csv
+# (interruption-resilient; baselines run last).
 # 10 reps per algorithm by default (~24h each); total wall time scales
 # with the number of algorithms selected (all 7 -> ~168h / 7 days), run
 # fully unattended.
@@ -106,9 +109,10 @@
 #     bash run_24h_7algos_production.sh --smoke-test
 #
 #   Defaults under --smoke-test (each individually overridable — see
-#   --help): RUNS=2, TIMEOUT=600s, POLL_INTERVAL=20s,
+#   --help): RUNS=2, TIMEOUT=300s, POLL_INTERVAL=20s,
 #   EARLY_FAILURE_WINDOW=40s, CONTAINER_START_WAIT=5s, and only the
-#   first 1 entry of ALL_ALGOS (EXP3) is run (override with --smoke-algos).
+#   first 2 entries of ALL_ALGOS (EXP3, EXP3-IX) are run (override with
+#   --smoke-algos).
 #
 #   Smoke-test runs are written under a distinctly-suffixed results
 #   directory (...-SMOKETEST, ...-SMOKETEST-2, ...) and use a separate
@@ -140,13 +144,12 @@ ALL_ALGOS=(
   "5:EXP3-IX"
   "6:UCB1"
   "7:THOMPSON_SAMPLING"
-  "1:RANDOM"
-  "2:ROUND-ROBIN"
   "3:FAVOR"
+  "2:ROUND-ROBIN"
+  "1:RANDOM"
 )
 
 MAX_SEEDS_PER_STATE=30                # must match config.h
-COV_FROZEN_RATIO=1.5                  # l_abs last/first below this = frozen (verify_coverage_outputs)
 
 # ---------------------------------------------------------------------------
 # CLI argument parsing — --smoke-test and individual overrides.
@@ -160,7 +163,7 @@ COV_FROZEN_RATIO=1.5                  # l_abs last/first below this = frozen (ve
 
 SMOKE_TEST=0
 PILOT=0
-SMOKE_ALGOS_COUNT=1   # how many entries of ALL_ALGOS to run under --smoke-test (1 = first algo = EXP3)
+SMOKE_ALGOS_COUNT=2   # how many entries of ALL_ALGOS to run under --smoke-test (2 = first two = EXP3, EXP3-IX)
 
 print_help() {
   cat <<EOF
@@ -204,12 +207,12 @@ Options:
   -h, --help                 Show this help and exit.
 
 Examples:
-  # Full end-to-end smoke test (1 algo x 2 reps x 10 min, fast poll/
+   # Full end-to-end smoke test (2 algos x 2 reps x 5 min, fast poll/
   # restart windows) — recommended before the real production launch:
   bash $0 --smoke-test
 
-  # Smoke test all 7 algorithms (still fast per-algorithm) instead of
-  # just the first 1:
+   # Smoke test all 7 algorithms (still fast per-algorithm) instead of
+   # just the first 2:
   bash $0 --smoke-test --smoke-algos 7
 
   # Fast 1h-per-algorithm validation of the 5 re-run algorithms (~5h):
@@ -359,7 +362,7 @@ if [ "$SMOKE_TEST" -eq 1 ]; then
   # when the condition is false would trip `set -e` and abort the whole
   # script.)
   if [ "$RUNS_EXPLICIT" -eq 0 ]; then RUNS=2; fi
-  if [ "$TIMEOUT_EXPLICIT" -eq 0 ]; then TIMEOUT=600; fi
+  if [ "$TIMEOUT_EXPLICIT" -eq 0 ]; then TIMEOUT=300; fi
   if [ "$POLL_INTERVAL_EXPLICIT" -eq 0 ]; then POLL_INTERVAL=20; fi
   if [ "$EARLY_FAILURE_WINDOW_EXPLICIT" -eq 0 ]; then EARLY_FAILURE_WINDOW=40; fi
   if [ "$CONTAINER_START_WAIT_EXPLICIT" -eq 0 ]; then CONTAINER_START_WAIT=5; fi
@@ -474,12 +477,6 @@ is_algo_completed() {
   local algo_key="$1"
   jq -e --arg a "$algo_key" '(.completed_algos // []) | index($a) != null' \
     "$STATE_FILE" >/dev/null 2>&1
-}
-
-is_coverage_done() { jq -e '.coverage == "done"' "$STATE_FILE" >/dev/null 2>&1; }
-mark_coverage_done() {
-  local tmp="${STATE_FILE}.tmp"
-  jq '.coverage = "done"' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
 }
 
 init_state_file
@@ -903,31 +900,6 @@ run_algo_single() {
 }
 
 # ---------------------------------------------------------------------------
-# Run all algorithms sequentially (one at a time, 10 reps in parallel
-# within each), skipping any already marked complete in the state file
-# (resume support).
-# ---------------------------------------------------------------------------
-
-run_all_algos_sequentially() {
-  log "====== Running ${#ALL_ALGOS[@]} algorithms sequentially ======"
-  local idx=1
-  for entry in "${ALL_ALGOS[@]}"; do
-    local S="${entry%%:*}"
-    local NAME="${entry##*:}"
-    if is_algo_completed "$entry"; then
-      log "  [$idx/${#ALL_ALGOS[@]}] Algorithm: s${S} (${NAME}) — already completed, skipping (resume)."
-      idx=$((idx + 1))
-      continue
-    fi
-    log "  [$idx/${#ALL_ALGOS[@]}] Algorithm: s${S} (${NAME})"
-    run_algo_single "$S" "$NAME"
-    idx=$((idx + 1))
-  done
-  log "====== All ${#ALL_ALGOS[@]} algorithms complete ======"
-  echo ""
-}
-
-# ---------------------------------------------------------------------------
 # Extract any tarballs not yet extracted (fallback — run_algo_single
 # extracts immediately, so this is a safety net).
 # ---------------------------------------------------------------------------
@@ -1015,22 +987,28 @@ verify_mab_outputs() {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 2 — sequential coverage generation (one container at a time).
+# Per-algo coverage regeneration (one container at a time).
 #
-# Regenerates cov_over_time_v2.csv for every rep, ONE container at a time
-# (sequential is the fix for the coverage-freeze bug — never parallel).
+# Regenerates cov_over_time_v2.csv for one algorithm's reps, ONE container at
+# a time (sequential is the fix for the coverage-freeze bug — never parallel).
 # Idempotent: skips reps whose _v2.csv already exists and is valid
-# (is_valid_csv), so a reboot mid-phase resumes cleanly. Each rep runs the
+# (is_valid_csv), so a reboot mid-algo resumes cleanly. Each rep runs the
 # stock cov_script inside the container with -it (a real pty is required).
+# Called once per algorithm by run_all_algos_with_coverage, right after that
+# algorithm's fuzz.
 # ---------------------------------------------------------------------------
 
-run_coverage_regen_sequential() {
+run_coverage_for_algo() {
+  local S="$1" NAME="$2"
+  local OUTDIR="out-24h-mab-s${S}-${NAME}-production"
+  log "  Coverage regen for s${S} (${NAME}) — one container at a time"
+  check_disk "s${S} (${NAME}) coverage"
   local scratch_root="${RESULTS_DIR}/_coverage_regen_scratch"
   mkdir -p "$scratch_root"
   shopt -s nullglob
-  local tarballs=("$RESULTS_DIR"/*.tar.gz)
+  local tarballs=("$RESULTS_DIR/${OUTDIR}_"*.tar.gz)
   if [ ${#tarballs[@]} -eq 0 ]; then
-    warn "No .tar.gz files found in $RESULTS_DIR — nothing to regenerate."
+    warn "  No tarballs for s${S} (${NAME}) — skipping coverage."
     return 0
   fi
   log "  Found ${#tarballs[@]} archives to process."
@@ -1089,28 +1067,51 @@ run_coverage_regen_sequential() {
     log "  [done] $base -> $out_csv ($(wc -l < "$out_csv") lines)"
     rm -rf "$work"
   done
-  log "  Coverage regeneration loop done."
+  log "  Coverage regen for s${S} (${NAME}) done."
+}
+
+run_all_algos_with_coverage() {
+  log "====== Running ${#ALL_ALGOS[@]} algorithms (fuzz + coverage, one at a time) ======"
+  local idx=1
+  for entry in "${ALL_ALGOS[@]}"; do
+    local S="${entry%%:*}"
+    local NAME="${entry##*:}"
+    log "  [$idx/${#ALL_ALGOS[@]}] Algorithm: s${S} (${NAME})"
+    if is_algo_completed "$entry"; then
+      log "    fuzz already completed (resume) — regenerating coverage only."
+    else
+      run_algo_single "$S" "$NAME"
+    fi
+    run_coverage_for_algo "$S" "$NAME"
+    idx=$((idx + 1))
+  done
+  log "====== All ${#ALL_ALGOS[@]} algorithms complete (fuzz + coverage) ======"
+  echo ""
 }
 
 verify_coverage_outputs() {
   log "=== Verifying coverage outputs ==="
   shopt -s nullglob
   local tarballs=("$RESULTS_DIR"/*.tar.gz)
-  local expect=${#tarballs[@]} n_found=0 n_missing=0 n_frozen=0 tb base out ratio
+  local expect=${#tarballs[@]} n_found=0 n_missing=0 n_invalid=0 tb base out reason rc
   for tb in "${tarballs[@]}"; do
     base=$(basename "$tb" .tar.gz)
     out="$RESULTS_DIR/${base}.cov_over_time_v2.csv"
     if [ ! -f "$out" ]; then n_missing=$((n_missing+1)); warn "  MISSING: $out"; continue; fi
     n_found=$((n_found+1))
-    # col 3 = l_abs (absolute line count); must climb over the replay.
-    ratio=$(awk -F',' 'NR>1 && $3+0>0 {if(f==""){f=$3} l=$3} END{ if(f=="") print "NA"; else printf "%.2f", l/f }' "$out" 2>/dev/null)
-    if [ "$ratio" = "NA" ] || { [ "$ratio" != "NA" ] && awk -v r="$ratio" -v th="$COV_FROZEN_RATIO" 'BEGIN{exit !(r<th)}'; }; then
-      n_frozen=$((n_frozen+1)); warn "  FROZEN/ZERO: $out (l_abs last/first=$ratio)"
+    # Same precise check the regen step uses: catches the frozen-at-row-5
+    # artifact, truncation vs. queue size, and empty/malformed files. The old
+    # crude l_abs last/first ratio false-positived on short runs that start
+    # high and climb slowly (e.g. a 10-min smoke-test).
+    rc=0
+    reason=$(is_valid_csv "$out" "$tb") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      n_invalid=$((n_invalid+1)); warn "  INVALID: $out ($reason)"
     fi
   done
-  log "  _v2.csv: $n_found/$expect present, $n_missing missing, $n_frozen frozen/zero"
-  if [ "$n_missing" -gt 0 ] || [ "$n_frozen" -gt 0 ]; then
-    warn "  Coverage problems found. Delete the affected _v2.csv and re-invoke to retry (idempotent)."
+  log "  _v2.csv: $n_found/$expect present, $n_missing missing, $n_invalid invalid"
+  if [ "$n_missing" -gt 0 ] || [ "$n_invalid" -gt 0 ]; then
+    warn "  Coverage problems found (see above)."
     return 1
   fi
   log "  Coverage verification: OK"
@@ -1178,38 +1179,6 @@ is_valid_csv() {
   fi
 
   return 0
-}
-
-run_coverage_phase() {
-  log "=== Phase 2: sequential coverage generation (one container at a time) ==="
-  local completed_n
-  completed_n=$(jq '.completed_algos | length' "$STATE_FILE" 2>/dev/null || echo 0)
-  if [ "$completed_n" -lt "${#ALL_ALGOS[@]}" ]; then
-    warn "Phase 2 skipped: Phase 1 incomplete (${completed_n}/${#ALL_ALGOS[@]} algos). Finish Phase 1 first."
-    return 0
-  fi
-  if is_coverage_done; then
-    log "  Coverage already marked done; re-running verification only."
-    verify_coverage_outputs || true
-    return 0
-  fi
-  check_disk "coverage phase"
-  log "  Running sequential coverage regeneration (one container at a time)..."
-  run_coverage_regen_sequential
-  local cov_ok=1
-  verify_coverage_outputs || cov_ok=0
-  if [ "$cov_ok" -eq 0 ]; then
-    if [ "$PILOT" -eq 1 ]; then
-      warn "  PILOT: coverage problems found (see above). Eyeball the l_abs values in the _v2.csv files before the full run."
-    else
-      die "  Coverage verification FAILED (missing or frozen/zero _v2.csv). Delete the affected _v2.csv file(s) and re-invoke to retry (idempotent)."
-    fi
-  fi
-  if [ "$cov_ok" -eq 1 ]; then
-    mark_coverage_done
-  fi
-  log "=== Phase 2 complete ==="
-  echo ""
 }
 
 # ---------------------------------------------------------------------------
@@ -1337,12 +1306,10 @@ print_summary() {
     [ -f "$RESULTS_DIR/${_base}.cov_over_time_v2.csv" ] && cov_found=$((cov_found+1))
   done
   shopt -u nullglob
-  local _cov_state
-  _cov_state=$(jq -r '.coverage // "pending"' "$STATE_FILE" 2>/dev/null || echo "pending")
-  if [ "$cov_expected" -gt 0 ] && [ "$cov_found" -eq "$cov_expected" ] && [ "$_cov_state" = "done" ]; then
-    log "  Coverage (Phase 2): OK — ${cov_found}/${cov_expected} _v2.csv present, all verified."
+  if [ "$cov_expected" -gt 0 ] && [ "$cov_found" -eq "$cov_expected" ]; then
+    log "  Coverage: OK — ${cov_found}/${cov_expected} _v2.csv present."
   else
-    log "  Coverage (Phase 2): ${cov_found}/${cov_expected} _v2.csv present (state: ${_cov_state})."
+    log "  Coverage: ${cov_found}/${cov_expected} _v2.csv present."
   fi
   log "=== Summary done ==="
   echo ""
@@ -1378,10 +1345,10 @@ main() {
 
   preflight
   check_disk "execution start"
-  run_all_algos_sequentially
+  run_all_algos_with_coverage
   extract_remaining
   verify_mab_outputs
-  run_coverage_phase
+  verify_coverage_outputs || true
   print_summary
 
   log "======================================================================"
